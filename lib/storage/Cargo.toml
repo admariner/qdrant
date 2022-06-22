@@ -10,17 +10,26 @@ tempdir = "0.3.7"
 
 [dependencies]
 
-sled = "0.34"
 num_cpus = "1.13"
 thiserror = "1.0"
-rand = "0.8.4"
-wal = { git = "https://github.com/generall/wal.git" }
-tokio = {version = "~1.15", features = ["rt-multi-thread"]}
+rand = "0.8.5"
+wal = { git = "https://github.com/qdrant/wal.git" }
+tokio = {version = "~1.19", features = ["rt-multi-thread"]}
 serde = { version = "~1.0", features = ["derive"] }
-schemars = "0.8.8"
+schemars = { version = "0.8.10", features = ["uuid1", "preserve_order"] }
 itertools = "0.10"
-async-trait = "0.1.52"
+async-trait = "0.1.56"
+log = "0.4"
+tonic = "0.7.2"
+http = "0.2"
+parking_lot = { version = "0.12.1", features=["deadlock_detection", "serde"]}
 
+# Consensus related
+atomicwrites = { version = "0.3.1" }
+raft = { git = "https://github.com/tikv/raft-rs", rev = "52d84aac8734369d81c2d77413ea3ab8e58e0af9", features = ["prost-codec"], default-features = false }
+prost = { version = "=0.10.1" } # version of prost used by raft
+serde_cbor = { version = "0.11.2" }
 
 segment = {path = "../segment"}
 collection = {path = "../collection"}
+api = {path = "../api"}

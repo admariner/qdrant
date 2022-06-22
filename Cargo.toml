@@ -1,6 +1,6 @@
 [package]
 name = "qdrant"
-version = "0.4.2"
+version = "0.8.1"
 authors = ["Andrey Vasnetsov <andrey@vasnetsov.com>"]
 edition = "2021"
 doctest = false
@@ -8,60 +8,60 @@ doctest = false
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = [ "web" ]
+default = [ "web", "parking_lot" ]
 web = ["actix-web"]
-grpc = ["tonic", "tonic-build", "prost", "num-traits"]
 service_debug = ["parking_lot", "parking_lot/deadlock_detection"]
-
 
 [dev-dependencies]
 tempdir = "0.3.7"
+rusty-hook = "^0.11.2"
 
 
 [dependencies]
 
-parking_lot = { version = "0.11", features=["deadlock_detection"], optional = true }
+parking_lot = { version = "0.12.1", features=["deadlock_detection"], optional = true }
 
 num_cpus = "1.13"
 thiserror = "1.0"
 log = "0.4"
 env_logger = "0.9.0"
-rand = "0.8.4"
+atty = "0.2"
+colored = "2"
 serde = { version = "~1.0", features = ["derive"] }
 serde_json = "~1.0"
-schemars = "0.8.8"
+schemars = { version = "0.8.10", features = ["uuid1", "preserve_order"] }
 itertools = "0.10"
+anyhow = "1.0.58"
+futures = "0.3.21"
+clap = { version = "3.2.2", features = ["derive"] }
+serde_cbor = { version = "0.11.2"}
+uuid = { version = "1.1", features = ["v4", "serde"] }
+sys-info = "0.9.1"
 
-config = "~0.11.0"
+config = "~0.13.1"
 
-tokio = { version = "~1.15", features = ["full"] }
+tokio = { version = "~1.19", features = ["full"] }
 
-actix-web = { version = "4.0.0-beta.21", optional = true }
-tonic =  { version = "0.6.2", optional = true }
-num-traits = { version = "0.2.14", optional = true }
-prost = { version = "0.9", optional = true }
+actix-web = { version = "4.1.0", optional = true }
+actix-cors = "0.6.1"
+tonic = "0.7.2"
+num-traits = "0.2.15"
+
+# Consensus related crates
+raft = { git = "https://github.com/tikv/raft-rs", rev = "52d84aac8734369d81c2d77413ea3ab8e58e0af9", features = ["prost-codec"], default-features = false }
+slog = "2.7.0"
+slog-stdlog = "4.1.1"
+prost = "=0.10.1"
+raft-proto = {  git = "https://github.com/tikv/raft-rs", rev = "52d84aac8734369d81c2d77413ea3ab8e58e0af9", features = ["prost-codec"], default-features = false}
 
 segment = { path = "lib/segment" }
 collection = { path = "lib/collection" }
 storage = { path = "lib/storage" }
-
-[build-dependencies]
-tonic-build = { version = "0.6.2", features = ["prost"], optional = true }
-
-[patch.crates-io]
-# Env flag OPENBLAS_DYNAMIC_ARCH is implemented in this custom fork
-# Which allows to build openblas with dynamic CPU architecture selection
-openblas-src = { git = "https://github.com/qdrant/openblas-src.git" }
+api = { path = "lib/api" }
 
 [[bin]]
 name = "schema_generator"
 path = "src/schema_generator.rs"
-test = false
-bench = false
-
-[[bin]]
-name = "cli"
-path = "src/cli.rs"
 test = false
 bench = false
 
