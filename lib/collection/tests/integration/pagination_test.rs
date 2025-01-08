@@ -1,8 +1,11 @@
+use api::rest::SearchRequestInternal;
 use collection::operations::point_ops::{
-    PointInsertOperations, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+    WriteOrdering,
 };
-use collection::operations::types::SearchRequest;
+use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::CollectionUpdateOperations;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::WithPayloadInterface;
 use tempfile::Builder;
 
@@ -25,35 +28,42 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
     // Upload 1000 random vectors to the collection
     let mut points = Vec::new();
     for i in 0..1000 {
-        points.push(PointStruct {
+        points.push(PointStructPersisted {
             id: i.into(),
-            vector: vec![i as f32, 0.0, 0.0, 0.0].into(),
+            vector: VectorStructPersisted::Single(vec![i as f32, 0.0, 0.0, 0.0]),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-        PointInsertOperations::PointsList(points),
+        PointInsertOperationsInternal::PointsList(points),
     ));
     collection
-        .update_from_client(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(insert_points, true, WriteOrdering::default())
         .await
         .unwrap();
 
     let query_vector = vec![1.0, 0.0, 0.0, 0.0];
 
-    let full_search_request = SearchRequest {
+    let full_search_request = SearchRequestInternal {
         vector: query_vector.clone().into(),
         filter: None,
         limit: 100,
-        offset: 0,
+        offset: Some(0),
         with_payload: Some(WithPayloadInterface::Bool(true)),
         with_vector: None,
         params: None,
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let reference_result = collection
-        .search(full_search_request, None, None)
+        .search(
+            full_search_request.into(),
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            hw_acc,
+        )
         .await
         .unwrap();
 
@@ -62,18 +72,28 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
 
     let page_size = 10;
 
-    let page_1_request = SearchRequest {
+    let page_1_request = SearchRequestInternal {
         vector: query_vector.clone().into(),
         filter: None,
         limit: 10,
-        offset: page_size,
+        offset: Some(page_size),
         with_payload: Some(WithPayloadInterface::Bool(true)),
         with_vector: None,
         params: None,
         score_threshold: None,
     };
 
-    let page_1_result = collection.search(page_1_request, None, None).await.unwrap();
+    let hw_acc = HwMeasurementAcc::new();
+    let page_1_result = collection
+        .search(
+            page_1_request.into(),
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            hw_acc,
+        )
+        .await
+        .unwrap();
 
     // Check that the first page is the same as the reference result
     assert_eq!(page_1_result.len(), 10);
@@ -81,18 +101,28 @@ async fn test_collection_paginated_search_with_shards(shard_number: u32) {
         assert_eq!(page_1_result[i], reference_result[page_size + i]);
     }
 
-    let page_9_request = SearchRequest {
+    let page_9_request = SearchRequestInternal {
         vector: query_vector.into(),
         filter: None,
         limit: 10,
-        offset: page_size * 9,
+        offset: Some(page_size * 9),
         with_payload: Some(WithPayloadInterface::Bool(true)),
         with_vector: None,
         params: None,
         score_threshold: None,
     };
 
-    let page_9_result = collection.search(page_9_request, None, None).await.unwrap();
+    let hw_acc = HwMeasurementAcc::new();
+    let page_9_result = collection
+        .search(
+            page_9_request.into(),
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            hw_acc,
+        )
+        .await
+        .unwrap();
 
     // Check that the 9th page is the same as the reference result
     assert_eq!(page_9_result.len(), 10);

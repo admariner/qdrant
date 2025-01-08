@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Some OpenAPI files in this repository are generated and based upon other
 # sources. When these sources change, the generated files must be generated
 # (and committed) again. It is the task of the contributing user to do this
@@ -34,3 +34,17 @@ fi
 
 # Cleanup
 rm -f ./docs/redoc/master/.diff.openapi.json
+
+NUMBER_OF_APIS=$(cat ./docs/redoc/master/openapi.json | jq '[.paths[] | length] | add')
+
+EXPECTED_NUMBER_OF_APIS=71
+
+if [ "$NUMBER_OF_APIS" -ne "$EXPECTED_NUMBER_OF_APIS" ]; then
+    echo "ERROR: It looks like the total number of APIs has changed."
+    echo "ERROR: Expected: $EXPECTED_NUMBER_OF_APIS, got: $NUMBER_OF_APIS"
+    echo "ERROR: Verify that all new APIs are correctly whitelisted (or not) for the metrics endpoint"
+    echo "ERROR: See: 'REST_ENDPOINT_WHITELIST' and 'GRPC_ENDPOINT_WHITELIST'"
+    echo "ERROR: once consistency is restored, please update EXPECTED_NUMBER_OF_APIS in this script"
+    exit 1
+fi
+

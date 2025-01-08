@@ -50,15 +50,16 @@ impl<T> StoppableTaskHandle<T> {
             Ok(_) => {}
             Err(err) if err.is_cancelled() => {}
             // Propagate panic
-            Err(err) if err.is_panic() && self.panic_handler.is_some() => {
-                log::trace!("Handling stoppable task panic through custom panic handler");
-                let panic = err.into_panic();
-                let panic_handler = self.panic_handler.unwrap();
-                panic_handler(panic);
-            }
-            Err(err) if err.is_panic() => {
-                log::debug!("Stoppable task panicked without panic handler");
-            }
+            Err(err) if err.is_panic() => match self.panic_handler {
+                Some(panic_handler) => {
+                    log::trace!("Handling stoppable task panic through custom panic handler");
+                    let panic = err.into_panic();
+                    panic_handler(panic);
+                }
+                None => {
+                    log::debug!("Stoppable task panicked without panic handler");
+                }
+            },
             // Log error on unknown error
             Err(err) => {
                 log::error!("Stoppable task handle error for unknown reason: {err}");
@@ -104,24 +105,13 @@ where
     }
 }
 
-/// Convert a panic payload into a string
-///
-/// This converts `String` and `&str` panic payloads into a string.
-/// Other payload types are formatted as is, and may be non descriptive.
-pub(crate) fn panic_payload_into_string(payload: PanicPayload) -> String {
-    payload
-        .downcast::<&str>()
-        .map(|msg| msg.to_string())
-        .or_else(|payload| payload.downcast::<String>().map(|msg| msg.to_string()))
-        .unwrap_or_else(|payload| format!("{payload:?}"))
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
     use std::thread;
     use std::time::{Duration, Instant};
 
+    use common::panic;
     use tokio::time::sleep;
 
     use super::*;
@@ -200,6 +190,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_task_panic() {
         let panic_payload = Arc::new(Mutex::new(String::new()));
+
         let handle = spawn_stoppable(
             |_| {
                 thread::sleep(STEP * 50);
@@ -207,8 +198,10 @@ mod tests {
             },
             Some(Box::new({
                 let panic_payload = panic_payload.clone();
+
                 move |payload| {
-                    *panic_payload.lock().unwrap() = panic_payload_into_string(payload);
+                    *panic_payload.lock().unwrap() =
+                        panic::downcast_str(&payload).unwrap_or("").into();
                 }
             })),
         );

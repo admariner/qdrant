@@ -1,3 +1,6 @@
+use std::num::NonZeroU64;
+use std::time::Duration;
+
 use collection::operations::consistency_params::ReadConsistency;
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -6,8 +9,20 @@ use validator::Validate;
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Deserialize, JsonSchema, Validate)]
 pub struct ReadParams {
     #[serde(default, deserialize_with = "deserialize_read_consistency")]
-    #[validate]
+    #[validate(nested)]
     pub consistency: Option<ReadConsistency>,
+    /// If set, overrides global timeout for this request. Unit is seconds.
+    pub timeout: Option<NonZeroU64>,
+}
+
+impl ReadParams {
+    pub fn timeout(&self) -> Option<Duration> {
+        self.timeout.map(|num| Duration::from_secs(num.get()))
+    }
+
+    pub(crate) fn timeout_as_secs(&self) -> Option<usize> {
+        self.timeout.map(|i| i.get() as usize)
+    }
 }
 
 fn deserialize_read_consistency<'de, D>(
@@ -26,9 +41,9 @@ where
     match Helper::deserialize(deserializer)? {
         Helper::ReadConsistency(read_consistency) => Ok(Some(read_consistency)),
         Helper::Str("") => Ok(None),
-        _ => Err(serde::de::Error::custom(
-            "failed to deserialize read consistency query parameter value",
-        )),
+        Helper::Str(x) => Err(serde::de::Error::custom(format!(
+            "failed to deserialize read consistency query parameter value '{x}'"
+        ))),
     }
 }
 
@@ -90,12 +105,14 @@ mod test {
     fn from_type(r#type: ReadConsistencyType) -> ReadParams {
         ReadParams {
             consistency: Some(ReadConsistency::Type(r#type)),
+            ..Default::default()
         }
     }
 
     fn from_factor(factor: usize) -> ReadParams {
         ReadParams {
             consistency: Some(ReadConsistency::Factor(factor)),
+            ..Default::default()
         }
     }
 }

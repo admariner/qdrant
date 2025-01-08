@@ -1,18 +1,14 @@
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::common::anonymize::Anonymize;
 use crate::common::operation_time_statistics::OperationDurationStatistics;
 use crate::types::{
-    PayloadIndexInfo, SegmentConfig, SegmentInfo, VectorDataConfig, VectorDataInfo,
+    PayloadIndexInfo, SegmentConfig, SegmentInfo, SparseVectorDataConfig, VectorDataConfig,
+    VectorDataInfo,
 };
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
-pub struct VectorIndexesTelemetry {
-    vector_index_searches: Vec<VectorIndexSearchesTelemetry>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct SegmentTelemetry {
     pub info: SegmentInfo,
     pub config: SegmentConfig,
@@ -20,14 +16,17 @@ pub struct SegmentTelemetry {
     pub payload_field_indices: Vec<PayloadIndexTelemetry>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct PayloadIndexTelemetry {
     pub field_name: Option<String>,
+
+    /// The amount of values indexed for all points.
     pub points_values_count: usize,
+
+    /// The amount of points that have at least one value indexed.
     pub points_count: usize,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub histogram_bucket_size: Option<usize>,
 }
 
@@ -38,7 +37,7 @@ impl PayloadIndexTelemetry {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema, Default)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Default)]
 pub struct VectorIndexSearchesTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub index_name: Option<String>,
@@ -48,6 +47,9 @@ pub struct VectorIndexSearchesTelemetry {
 
     #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
     pub unfiltered_hnsw: OperationDurationStatistics,
+
+    #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
+    pub unfiltered_sparse: OperationDurationStatistics,
 
     #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
     pub filtered_plain: OperationDurationStatistics,
@@ -60,6 +62,9 @@ pub struct VectorIndexSearchesTelemetry {
 
     #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
     pub filtered_exact: OperationDurationStatistics,
+
+    #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
+    pub filtered_sparse: OperationDurationStatistics,
 
     #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
     pub unfiltered_exact: OperationDurationStatistics,
@@ -84,6 +89,8 @@ impl Anonymize for SegmentInfo {
             num_points: self.num_points.anonymize(),
             num_indexed_vectors: self.num_indexed_vectors.anonymize(),
             num_deleted_vectors: self.num_deleted_vectors.anonymize(),
+            vectors_size_bytes: self.vectors_size_bytes.anonymize(),
+            payloads_size_bytes: self.payloads_size_bytes.anonymize(),
             ram_usage_bytes: self.ram_usage_bytes.anonymize(),
             disk_usage_bytes: self.disk_usage_bytes.anonymize(),
             is_appendable: self.is_appendable,
@@ -117,6 +124,7 @@ impl Anonymize for SegmentConfig {
     fn anonymize(&self) -> Self {
         SegmentConfig {
             vector_data: self.vector_data.anonymize(),
+            sparse_vector_data: self.sparse_vector_data.anonymize(),
             payload_storage_type: self.payload_storage_type,
         }
     }
@@ -129,7 +137,18 @@ impl Anonymize for VectorDataConfig {
             distance: self.distance,
             storage_type: self.storage_type,
             index: self.index.clone(),
-            quantization_config: None,
+            quantization_config: self.quantization_config.clone(),
+            multivector_config: self.multivector_config,
+            datatype: self.datatype,
+        }
+    }
+}
+
+impl Anonymize for SparseVectorDataConfig {
+    fn anonymize(&self) -> Self {
+        SparseVectorDataConfig {
+            index: self.index.anonymize(),
+            storage_type: self.storage_type,
         }
     }
 }
@@ -140,10 +159,12 @@ impl Anonymize for VectorIndexSearchesTelemetry {
             index_name: None,
             unfiltered_plain: self.unfiltered_plain.anonymize(),
             unfiltered_hnsw: self.unfiltered_hnsw.anonymize(),
+            unfiltered_sparse: self.unfiltered_sparse.anonymize(),
             filtered_plain: self.filtered_plain.anonymize(),
             filtered_small_cardinality: self.filtered_small_cardinality.anonymize(),
             filtered_large_cardinality: self.filtered_large_cardinality.anonymize(),
             filtered_exact: self.filtered_exact.anonymize(),
+            filtered_sparse: self.filtered_sparse.anonymize(),
             unfiltered_exact: self.filtered_exact.anonymize(),
         }
     }

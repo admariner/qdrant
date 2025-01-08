@@ -1,11 +1,20 @@
 //! Contains functions for interpreting filter queries and defining if given points pass the conditions
 
+use std::str::FromStr;
+
 use serde_json::Value;
 
 use crate::types::{
-    AnyVariants, FieldCondition, GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius, Match, MatchAny,
-    MatchExcept, MatchText, MatchValue, Range, ValueVariants, ValuesCount,
+    AnyVariants, DateTimePayloadType, FieldCondition, FloatPayloadType, GeoBoundingBox, GeoPoint,
+    GeoPolygon, GeoRadius, Match, MatchAny, MatchExcept, MatchText, MatchValue, Range,
+    RangeInterface, ValueVariants, ValuesCount,
 };
+
+/// Threshold representing the point to which iterating through an IndexSet is more efficient than using hashing.
+///
+/// For sets smaller than this threshold iterating outperforms hashing.
+/// For more information see <https://github.com/qdrant/qdrant/pull/3525>.
+pub const INDEXSET_ITER_THRESHOLD: usize = 13;
 
 pub trait ValueChecker {
     fn check_match(&self, payload: &Value) -> bool;
@@ -25,44 +34,46 @@ pub trait ValueChecker {
 
 impl ValueChecker for FieldCondition {
     fn check_match(&self, payload: &Value) -> bool {
-        let mut res = false;
-        // ToDo: Convert onto iterator over checkers, so it would be impossible to forget a condition
-        res = res
-            || self
-                .r#match
+        // Destructuring so compiler can check that we don't forget a condition
+        let FieldCondition {
+            r#match,
+            range,
+            geo_radius,
+            geo_bounding_box,
+            geo_polygon,
+            values_count,
+            key: _,
+        } = self;
+
+        r#match
+            .as_ref()
+            .is_some_and(|condition| condition.check_match(payload))
+            || range
                 .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res = res
-            || self
-                .range
+                .is_some_and(|range_interface| match range_interface {
+                    RangeInterface::Float(condition) => condition.check_match(payload),
+                    RangeInterface::DateTime(condition) => condition.check_match(payload),
+                })
+            || geo_radius
                 .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res = res
-            || self
-                .geo_radius
+                .is_some_and(|condition| condition.check_match(payload))
+            || geo_bounding_box
                 .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res = res
-            || self
-                .geo_bounding_box
+                .is_some_and(|condition| condition.check_match(payload))
+            || geo_polygon
                 .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res = res
-            || self
-                .geo_polygon
+                .is_some_and(|condition| condition.check_match(payload))
+            || values_count
                 .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res = res
-            || self
-                .values_count
-                .as_ref()
-                .map_or(false, |condition| condition.check_match(payload));
-        res
+                .is_some_and(|condition| condition.check_match(payload))
     }
 
     fn check(&self, payload: &Value) -> bool {
         if self.values_count.is_some() {
-            self.values_count.as_ref().unwrap().check_count(payload)
+            self.values_count
+                .as_ref()
+                .unwrap()
+                .check_count_from(payload)
         } else {
             self._check(payload)
         }
@@ -74,7 +85,7 @@ impl ValueChecker for Match {
         match self {
             Match::Value(MatchValue { value }) => match (payload, value) {
                 (Value::Bool(stored), ValueVariants::Bool(val)) => stored == val,
-                (Value::String(stored), ValueVariants::Keyword(val)) => stored == val,
+                (Value::String(stored), ValueVariants::String(val)) => stored == val,
                 (Value::Number(stored), ValueVariants::Integer(val)) => {
                     stored.as_i64().map(|num| num == *val).unwrap_or(false)
                 }
@@ -85,18 +96,42 @@ impl ValueChecker for Match {
                 _ => false,
             },
             Match::Any(MatchAny { any }) => match (payload, any) {
-                (Value::String(stored), AnyVariants::Keywords(list)) => list.contains(stored),
+                (Value::String(stored), AnyVariants::Strings(list)) => {
+                    if list.len() < INDEXSET_ITER_THRESHOLD {
+                        list.iter().any(|i| i.as_str() == stored.as_str())
+                    } else {
+                        list.contains(stored.as_str())
+                    }
+                }
                 (Value::Number(stored), AnyVariants::Integers(list)) => stored
                     .as_i64()
-                    .map(|num| list.contains(&num))
+                    .map(|num| {
+                        if list.len() < INDEXSET_ITER_THRESHOLD {
+                            list.iter().any(|i| *i == num)
+                        } else {
+                            list.contains(&num)
+                        }
+                    })
                     .unwrap_or(false),
                 _ => false,
             },
             Match::Except(MatchExcept { except }) => match (payload, except) {
-                (Value::String(stored), AnyVariants::Keywords(list)) => !list.contains(stored),
+                (Value::String(stored), AnyVariants::Strings(list)) => {
+                    if list.len() < INDEXSET_ITER_THRESHOLD {
+                        !list.iter().any(|i| i.as_str() == stored.as_str())
+                    } else {
+                        !list.contains(stored.as_str())
+                    }
+                }
                 (Value::Number(stored), AnyVariants::Integers(list)) => stored
                     .as_i64()
-                    .map(|num| !list.contains(&num))
+                    .map(|num| {
+                        if list.len() < INDEXSET_ITER_THRESHOLD {
+                            !list.iter().any(|i| *i == num)
+                        } else {
+                            !list.contains(&num)
+                        }
+                    })
                     .unwrap_or(true),
                 (Value::Null, _) => false,
                 (Value::Bool(_), _) => true,
@@ -109,7 +144,7 @@ impl ValueChecker for Match {
     }
 }
 
-impl ValueChecker for Range {
+impl ValueChecker for Range<FloatPayloadType> {
     fn check_match(&self, payload: &Value) -> bool {
         match payload {
             Value::Number(num) => num
@@ -118,6 +153,15 @@ impl ValueChecker for Range {
                 .unwrap_or(false),
             _ => false,
         }
+    }
+}
+
+impl ValueChecker for Range<DateTimePayloadType> {
+    fn check_match(&self, payload: &Value) -> bool {
+        payload
+            .as_str()
+            .and_then(|s| DateTimePayloadType::from_str(s).ok())
+            .is_some_and(|x| self.check_range(x))
     }
 }
 
@@ -174,11 +218,11 @@ impl ValueChecker for GeoPolygon {
 
 impl ValueChecker for ValuesCount {
     fn check_match(&self, payload: &Value) -> bool {
-        self.check_count(payload)
+        self.check_count_from(payload)
     }
 
     fn check(&self, payload: &Value) -> bool {
-        self.check_count(payload)
+        self.check_count_from(payload)
     }
 }
 

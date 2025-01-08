@@ -2,13 +2,17 @@ use collection::collection::Collection;
 use collection::lookup::types::PseudoId;
 use collection::lookup::{lookup_ids, WithLookup};
 use collection::operations::consistency_params::ReadConsistency;
-use collection::operations::point_ops::{Batch, WriteOrdering};
+use collection::operations::point_ops::{
+    BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    WriteOrdering,
+};
+use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::shards::shard::ShardId;
 use itertools::Itertools;
 use rand::rngs::SmallRng;
 use rand::{self, Rng, SeedableRng};
 use rstest::*;
-use segment::data_types::vectors::VectorStruct;
+use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{Payload, PointIdType};
 use serde_json::json;
 use tempfile::Builder;
@@ -54,17 +58,18 @@ async fn setup() -> Resources {
         .map(|i| Some(Payload::from(json!({ "foo": format!("bar {}", i) }))))
         .collect_vec();
 
+    let batch = BatchPersisted {
+        ids,
+        vectors: BatchVectorStructPersisted::Single(vectors),
+        payloads: Some(payloads),
+    };
+
     let upsert_points = collection::operations::CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids,
-            vectors: vectors.into(),
-            payloads: Some(payloads),
-        }
-        .into(),
+        PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
     );
 
     collection
-        .update_from_client(upsert_points, true, WriteOrdering::default())
+        .update_from_client_simple(upsert_points, true, WriteOrdering::default())
         .await
         .unwrap();
 
@@ -105,12 +110,18 @@ async fn happy_lookup_ids() {
     request.with_payload = Some(true.into());
     request.with_vectors = Some(true.into());
 
+    let shard_selection = match shard_selection {
+        Some(shard_id) => ShardSelectorInternal::ShardId(shard_id),
+        None => ShardSelectorInternal::All,
+    };
+
     let result = lookup_ids(
         request.clone(),
         values.clone(),
         collection_by_name,
         read_consistency,
-        shard_selection,
+        &shard_selection,
+        None,
     )
     .await;
 
@@ -127,12 +138,12 @@ async fn happy_lookup_ids() {
         .map(|i| (i, rng.gen::<[f32; 4]>().to_vec()))
         .filter(|(i, _)| !(&n..&1000).contains(&i))
         .map(|(_, v)| v)
-        .map(VectorStruct::from);
+        .map(VectorStructInternal::from);
 
     for (id_value, vector) in values.into_iter().zip(expected_vectors) {
         let record = result
             .get(&id_value)
-            .unwrap_or_else(|| panic!("Expected to find record for id {}", id_value));
+            .unwrap_or_else(|| panic!("Expected to find record for id {id_value}"));
 
         assert_eq!(record.id, PointIdType::try_from(id_value.clone()).unwrap());
         assert_eq!(
@@ -180,6 +191,11 @@ async fn nonexistent_lookup_ids_are_ignored(#[case] value: impl Into<PseudoId>) 
         shard_selection,
     } = setup().await;
 
+    let shard_selection = match shard_selection {
+        Some(shard_id) => ShardSelectorInternal::ShardId(shard_id),
+        None => ShardSelectorInternal::All,
+    };
+
     let collection = collection.read().await;
 
     let collection_by_name = |_: String| async { Some(collection) };
@@ -193,7 +209,8 @@ async fn nonexistent_lookup_ids_are_ignored(#[case] value: impl Into<PseudoId>) 
         values,
         collection_by_name,
         read_consistency,
-        shard_selection,
+        &shard_selection,
+        None,
     )
     .await;
 
@@ -213,6 +230,11 @@ async fn err_when_collection_by_name_returns_none() {
         ..
     } = setup().await;
 
+    let shard_selection = match shard_selection {
+        Some(shard_id) => ShardSelectorInternal::ShardId(shard_id),
+        None => ShardSelectorInternal::All,
+    };
+
     let collection_by_name = |_: String| async { None };
 
     let result = lookup_ids(
@@ -220,7 +242,8 @@ async fn err_when_collection_by_name_returns_none() {
         vec![],
         collection_by_name,
         read_consistency,
-        shard_selection,
+        &shard_selection,
+        None,
     )
     .await;
 

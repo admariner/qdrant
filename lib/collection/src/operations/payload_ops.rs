@@ -1,13 +1,16 @@
+use api::rest::ShardKeySelector;
 use schemars::JsonSchema;
+use segment::json_path::JsonPath;
 use segment::types::{Filter, Payload, PayloadKeyType, PointIdType};
 use serde;
 use serde::{Deserialize, Serialize};
+use strum::{EnumDiscriminants, EnumIter};
 use validator::Validate;
 
 use super::{split_iter_by_shard, OperationToShard, SplitByShard};
-use crate::hash_ring::HashRing;
-use crate::shards::shard::ShardId;
+use crate::hash_ring::HashRingRouter;
 
+/// This data structure is used in API interface and applied across multiple shards
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 #[serde(try_from = "SetPayloadShadow")]
 pub struct SetPayload {
@@ -16,6 +19,26 @@ pub struct SetPayload {
     pub points: Option<Vec<PointIdType>>,
     /// Assigns payload to each point that satisfy this filter condition
     pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+    /// Assigns payload to each point that satisfy this path of property
+    pub key: Option<JsonPath>,
+}
+
+/// This data structure is used inside shard operations queue
+/// and supposed to be written into WAL of individual shard.
+///
+/// Unlike `SetPayload` it does not contain `shard_key` field
+/// as individual shard does not need to know about shard key
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct SetPayloadOp {
+    pub payload: Payload,
+    /// Assigns payload to each point in this list
+    pub points: Option<Vec<PointIdType>>,
+    /// Assigns payload to each point that satisfy this filter condition
+    pub filter: Option<Filter>,
+    /// Payload selector to indicate property of payload, e.g. `a.b.c`
+    pub key: Option<JsonPath>,
 }
 
 #[derive(Deserialize)]
@@ -23,6 +46,8 @@ struct SetPayloadShadow {
     pub payload: Payload,
     pub points: Option<Vec<PointIdType>>,
     pub filter: Option<Filter>,
+    pub shard_key: Option<ShardKeySelector>,
+    pub key: Option<JsonPath>,
 }
 
 pub struct PointsSelectorValidationError;
@@ -45,6 +70,8 @@ impl TryFrom<SetPayloadShadow> for SetPayload {
                 payload: value.payload,
                 points: value.points,
                 filter: value.filter,
+                shard_key: value.shard_key,
+                key: value.key,
             })
         } else {
             Err(PointsSelectorValidationError)
@@ -52,9 +79,27 @@ impl TryFrom<SetPayloadShadow> for SetPayload {
     }
 }
 
+/// This data structure is used in API interface and applied across multiple shards
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 #[serde(try_from = "DeletePayloadShadow")]
 pub struct DeletePayload {
+    /// List of payload keys to remove from payload
+    pub keys: Vec<PayloadKeyType>,
+    /// Deletes values from each point in this list
+    pub points: Option<Vec<PointIdType>>,
+    /// Deletes values from points that satisfy this filter condition
+    pub filter: Option<Filter>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_key: Option<ShardKeySelector>,
+}
+
+/// This data structure is used inside shard operations queue
+/// and supposed to be written into WAL of individual shard.
+///
+/// Unlike `DeletePayload` it does not contain `shard_key` field
+/// as individual shard does not need to know about shard key
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+pub struct DeletePayloadOp {
     /// List of payload keys to remove from payload
     pub keys: Vec<PayloadKeyType>,
     /// Deletes values from each point in this list
@@ -68,6 +113,7 @@ struct DeletePayloadShadow {
     pub keys: Vec<PayloadKeyType>,
     pub points: Option<Vec<PointIdType>>,
     pub filter: Option<Filter>,
+    pub shard_key: Option<ShardKeySelector>,
 }
 
 impl TryFrom<DeletePayloadShadow> for DeletePayload {
@@ -79,6 +125,7 @@ impl TryFrom<DeletePayloadShadow> for DeletePayload {
                 keys: value.keys,
                 points: value.points,
                 filter: value.filter,
+                shard_key: value.shard_key,
             })
         } else {
             Err(PointsSelectorValidationError)
@@ -87,19 +134,20 @@ impl TryFrom<DeletePayloadShadow> for DeletePayload {
 }
 
 /// Define operations description for point payloads manipulation
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, EnumDiscriminants)]
+#[strum_discriminants(derive(EnumIter))]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadOps {
     /// Set payload value, overrides if it is already exists
-    SetPayload(SetPayload),
+    SetPayload(SetPayloadOp),
     /// Deletes specified payload values if they are assigned
-    DeletePayload(DeletePayload),
+    DeletePayload(DeletePayloadOp),
     /// Drops all Payload values associated with given points.
     ClearPayload { points: Vec<PointIdType> },
     /// Clear all Payload values by given filter criteria.
     ClearPayloadByFilter(Filter),
     /// Overwrite full payload with given keys
-    OverwritePayload(SetPayload),
+    OverwritePayload(SetPayloadOp),
 }
 
 impl PayloadOps {
@@ -112,22 +160,42 @@ impl PayloadOps {
             PayloadOps::OverwritePayload(_) => true,
         }
     }
-}
 
-impl Validate for PayloadOps {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
-            PayloadOps::SetPayload(operation) => operation.validate(),
-            PayloadOps::DeletePayload(operation) => operation.validate(),
-            PayloadOps::ClearPayload { .. } => Ok(()),
-            PayloadOps::ClearPayloadByFilter(_) => Ok(()),
-            PayloadOps::OverwritePayload(operation) => operation.validate(),
+            Self::SetPayload(op) => op.points.clone(),
+            Self::DeletePayload(op) => op.points.clone(),
+            Self::ClearPayload { points } => Some(points.clone()),
+            Self::ClearPayloadByFilter(_) => None,
+            Self::OverwritePayload(op) => op.points.clone(),
+        }
+    }
+
+    pub fn retain_point_ids<F>(&mut self, filter: F)
+    where
+        F: Fn(&PointIdType) -> bool,
+    {
+        match self {
+            Self::SetPayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::DeletePayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::ClearPayload { points } => points.retain(filter),
+            Self::ClearPayloadByFilter(_) => (),
+            Self::OverwritePayload(op) => retain_opt(op.points.as_mut(), filter),
         }
     }
 }
 
+fn retain_opt<T, F>(vec: Option<&mut Vec<T>>, filter: F)
+where
+    F: Fn(&T) -> bool,
+{
+    if let Some(vec) = vec {
+        vec.retain(filter);
+    }
+}
+
 impl SplitByShard for PayloadOps {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match self {
             PayloadOps::SetPayload(operation) => {
                 operation.split_by_shard(ring).map(PayloadOps::SetPayload)
@@ -145,12 +213,12 @@ impl SplitByShard for PayloadOps {
     }
 }
 
-impl SplitByShard for DeletePayload {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+impl SplitByShard for DeletePayloadOp {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match (&self.points, &self.filter) {
             (Some(_), _) => {
                 split_iter_by_shard(self.points.unwrap(), |id| *id, ring).map(|points| {
-                    DeletePayload {
+                    DeletePayloadOp {
                         points: Some(points),
                         keys: self.keys.clone(),
                         filter: self.filter.clone(),
@@ -163,14 +231,17 @@ impl SplitByShard for DeletePayload {
     }
 }
 
-impl SplitByShard for SetPayload {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+impl SplitByShard for SetPayloadOp {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match (&self.points, &self.filter) {
             (Some(_), _) => {
-                split_iter_by_shard(self.points.unwrap(), |id| *id, ring).map(|points| SetPayload {
-                    points: Some(points),
-                    payload: self.payload.clone(),
-                    filter: self.filter.clone(),
+                split_iter_by_shard(self.points.unwrap(), |id| *id, ring).map(|points| {
+                    SetPayloadOp {
+                        points: Some(points),
+                        payload: self.payload.clone(),
+                        filter: self.filter.clone(),
+                        key: self.key.clone(),
+                    }
                 })
             }
             (None, Some(_)) => OperationToShard::to_all(self),
@@ -233,7 +304,7 @@ mod tests {
                 assert!(payload.contains_key("key1"));
 
                 let payload_type = payload
-                    .get_value("key1")
+                    .get_value(&"key1".parse().unwrap())
                     .into_iter()
                     .next()
                     .cloned()
@@ -244,7 +315,11 @@ mod tests {
                     _ => panic!("Wrong payload type"),
                 }
 
-                let payload_type_json = payload.get_value("key3").into_iter().next().cloned();
+                let payload_type_json = payload
+                    .get_value(&"key3".parse().unwrap())
+                    .into_iter()
+                    .next()
+                    .cloned();
 
                 assert!(matches!(payload_type_json, Some(Value::Object(_))))
             }

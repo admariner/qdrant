@@ -8,62 +8,90 @@ authors = [
 license = "Apache-2.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [features]
+testing = []
 tracing = ["dep:tracing", "api/tracing", "segment/tracing"]
+data-consistency-check = []
 
 [dev-dependencies]
-criterion = "0.5"
-rstest = "0.18.2"
+criterion = { workspace = true }
+proptest = { workspace = true }
+rstest = { workspace = true }
+approx = "0.5.1"
+collection = { path = ".", features = ["testing"] }
+common = { path = "../common/common", features = ["testing"] }
+segment = { path = "../segment", features = ["testing"] }
 
 [target.'cfg(not(target_os = "windows"))'.dev-dependencies]
-pprof = { version = "0.12", features = ["flamegraph", "prost-codec"] }
+pprof = { workspace = true }
 
 [dependencies]
+parking_lot = { workspace = true }
+ahash = { workspace = true }
+rand = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_cbor = { workspace = true }
+serde_json = { workspace = true }
+serde_variant = { workspace = true }
+rmp-serde = "~1.3"
+wal = { workspace = true }
+ordered-float = { workspace = true }
+hashring = "0.3.6"
+tinyvec = { version = "1.8.1", features = ["alloc"] }
+bitvec = { workspace = true }
+lazy_static = "1.5.0"
+smallvec = "1.13.2"
 
-parking_lot = "0.12"
-
-rand = "0.8.5"
-thiserror = "1.0"
-serde = { version = "~1.0", features = ["derive"] }
-serde_json = { version = "~1.0", features = ["std"] }
-serde_cbor = "0.11.2"
-rmp-serde = "~1.1"
-wal = { git = "https://github.com/qdrant/wal.git", rev = "a32f6a38acf7ffd761df83b0790eaefeb107cd60"}
-ordered-float = "3.9"
-hashring = "0.3.2"
-tinyvec = { version = "1.6.0", features = ["alloc"] }
-
-tokio = {version = "~1.32", features = ["full"]}
-futures = "0.3.28"
-atomicwrites = "0.4.1"
-log = "0.4"
-env_logger = "0.10.0"
-merge = "0.1.0"
-async-trait = "0.1.73"
-arc-swap = "1.6.0"
-tonic = { version = "0.9.2", features = ["gzip", "tls"] }
-tower = "0.4.13"
-uuid = { version = "1.4", features = ["v4", "serde"] }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+atomicwrites = { workspace = true}
+log = { workspace = true }
+env_logger = "0.11"
+merge = { workspace = true }
+async-trait = "0.1.84"
+arc-swap = "1.7.1"
+tonic = { workspace = true }
+uuid = { workspace = true }
 url = { version = "2", features = ["serde"] }
-validator = { version = "0.16", features = ["derive"] }
-actix-web-validator = "5.0.1"
+validator = { workspace = true }
+actix-web-validator = "6.0.0"
+actix-web = { version = "4.9.0" }
+actix-files = "0.6.6"
 
 common = { path = "../common/common" }
+cancel = { path = "../common/cancel" }
 io = { path = "../common/io" }
-segment = {path = "../segment"}
-api = {path = "../api"}
+issues = { path = "../common/issues" }
+segment = { path = "../segment" }
+sparse = { path = "../sparse" }
+api = { path = "../api" }
 
-itertools = "0.11"
-indicatif = "0.17.6"
-chrono = { version = "~0.4", features = ["serde"] }
-schemars = { version = "0.8.15", features = ["uuid1", "preserve_order", "chrono", "url"] }
-num_cpus = "1.16.0"
-tar = "0.4.40"
+itertools = { workspace = true }
+indicatif = { workspace = true }
+chrono = { workspace = true }
+schemars = { workspace = true }
+tar = { workspace = true }
 fs_extra = "1.3.0"
-semver = "1.0.18"
-tempfile = "3.8.0"
+semver = { workspace = true }
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+bytes = { workspace = true }
+fnv = { workspace = true }
+indexmap = { workspace = true }
+ringbuffer = "0.15.0"
+strum = { workspace = true }
 
-tracing = { version = "0.1", features = ["async-await"], optional = true }
+tracing = { workspace = true, optional = true }
+fs4 = "0.12.0"
+
+# AWS S3 support
+object_store = { version = "0.11.2", features = ["aws"] }
+
 
 [[bench]]
 name = "hash_ring_bench"
@@ -71,4 +99,8 @@ harness = false
 
 [[bench]]
 name = "batch_search_bench"
+harness = false
+
+[[bench]]
+name = "batch_query_bench"
 harness = false

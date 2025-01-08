@@ -5,10 +5,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use atomicwrites::Error as AtomicIoError;
 use io::file_operations::FileStorageError;
+use memory::mmap_type::Error as MmapError;
 use rayon::ThreadPoolBuildError;
 use thiserror::Error;
 
-use crate::common::mmap_type::Error as MmapError;
 use crate::types::{PayloadKeyType, PointIdType, SeqNumberType};
 use crate::utils::mem::Mem;
 
@@ -17,8 +17,8 @@ pub const PROCESS_CANCELLED_BY_SERVICE_MESSAGE: &str = "process cancelled by ser
 #[derive(Error, Debug, Clone)]
 #[error("{0}")]
 pub enum OperationError {
-    #[error("Vector inserting error: expected dim: {expected_dim}, got {received_dim}")]
-    WrongVector {
+    #[error("Vector dimension error: expected dim: {expected_dim}, got {received_dim}")]
+    WrongVectorDimension {
         expected_dim: usize,
         received_dim: usize,
     },
@@ -50,13 +50,31 @@ pub enum OperationError {
     Cancelled { description: String },
     #[error("Validation failed: {description}")]
     ValidationError { description: String },
+    #[error("Wrong usage of sparse vectors")]
+    WrongSparse,
+    #[error("Wrong usage of multi vectors")]
+    WrongMulti,
+    #[error("No range index for `order_by` key: `{key}`. Please create one to use `order_by`. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Range conditions")]
+    MissingRangeIndexForOrderBy { key: String },
+    #[error("No appropriate index for faceting: `{key}`. Please create one to facet on this field. Check https://qdrant.tech/documentation/concepts/indexing/#payload-index to see which payload schemas support Match conditions")]
+    MissingMapIndexForFacet { key: String },
 }
 
 impl OperationError {
+    /// Create a new service error with a description and a backtrace
+    /// Warning: capturing a backtrace can be an expensive operation on some platforms, so this should be used with caution in performance-sensitive parts of code.
     pub fn service_error(description: impl Into<String>) -> OperationError {
         OperationError::ServiceError {
             description: description.into(),
             backtrace: Some(Backtrace::force_capture().to_string()),
+        }
+    }
+
+    /// Create a new service error with a description and no backtrace
+    pub fn service_error_light(description: impl Into<String>) -> OperationError {
+        OperationError::ServiceError {
+            description: description.into(),
+            backtrace: None,
         }
     }
 }
@@ -76,15 +94,6 @@ pub struct SegmentFailedState {
     pub version: SeqNumberType,
     pub point_id: Option<PointIdType>,
     pub error: OperationError,
-}
-
-impl From<semver::Error> for OperationError {
-    fn from(error: semver::Error) -> Self {
-        OperationError::ServiceError {
-            description: error.to_string(),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
-    }
 }
 
 impl From<ThreadPoolBuildError> for OperationError {
@@ -152,6 +161,12 @@ impl From<fs_extra::error::Error> for OperationError {
     }
 }
 
+impl From<geohash::GeohashError> for OperationError {
+    fn from(err: geohash::GeohashError) -> Self {
+        OperationError::service_error(format!("Geohash error: {err}"))
+    }
+}
+
 impl From<quantization::EncodingError> for OperationError {
     fn from(err: quantization::EncodingError) -> Self {
         match err {
@@ -174,6 +189,13 @@ impl From<TryReserveError> for OperationError {
             description: format!("Failed to reserve memory: {err}"),
             free: free_memory,
         }
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl From<gpu::GpuError> for OperationError {
+    fn from(err: gpu::GpuError) -> Self {
+        Self::service_error(format!("GPU error: {err:?}"))
     }
 }
 

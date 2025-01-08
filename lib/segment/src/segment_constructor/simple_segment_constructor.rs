@@ -5,7 +5,9 @@ use crate::common::operation_error::OperationResult;
 use crate::data_types::vectors::DEFAULT_VECTOR_NAME;
 use crate::segment::Segment;
 use crate::segment_constructor::build_segment;
-use crate::types::{Distance, Indexes, SegmentConfig, VectorDataConfig, VectorStorageType};
+use crate::types::{
+    Distance, Indexes, PayloadStorageType, SegmentConfig, VectorDataConfig, VectorStorageType,
+};
 
 /// Build new segment with plain index in given directory
 ///
@@ -29,9 +31,40 @@ pub fn build_simple_segment(
                     storage_type: VectorStorageType::Memory,
                     index: Indexes::Plain {},
                     quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
                 },
             )]),
+            sparse_vector_data: Default::default(),
             payload_storage_type: Default::default(),
+        },
+        true,
+    )
+}
+
+pub fn build_simple_segment_with_payload_storage(
+    path: &Path,
+    dim: usize,
+    distance: Distance,
+    payload_storage_type: PayloadStorageType,
+) -> OperationResult<Segment> {
+    build_segment(
+        path,
+        &SegmentConfig {
+            vector_data: HashMap::from([(
+                DEFAULT_VECTOR_NAME.to_owned(),
+                VectorDataConfig {
+                    size: dim,
+                    distance,
+                    storage_type: VectorStorageType::Memory,
+                    index: Indexes::Plain {},
+                    quantization_config: None,
+                    multivector_config: None,
+                    datatype: None,
+                },
+            )]),
+            sparse_vector_data: Default::default(),
+            payload_storage_type,
         },
         true,
     )
@@ -52,6 +85,8 @@ pub fn build_multivec_segment(
             storage_type: VectorStorageType::Memory,
             index: Indexes::Plain {},
             quantization_config: None,
+            multivector_config: None,
+            datatype: None,
         },
     );
     vectors_config.insert(
@@ -62,6 +97,8 @@ pub fn build_multivec_segment(
             storage_type: VectorStorageType::Memory,
             index: Indexes::Plain {},
             quantization_config: None,
+            multivector_config: None,
+            datatype: None,
         },
     );
 
@@ -69,6 +106,7 @@ pub fn build_multivec_segment(
         path,
         &SegmentConfig {
             vector_data: vectors_config,
+            sparse_vector_data: Default::default(),
             payload_storage_type: Default::default(),
         },
         true,
@@ -106,7 +144,7 @@ mod tests {
         let vec5 = vec![1.0, 0.0, 0.0, 0.0];
 
         match segment.upsert_point(1, 120.into(), only_default_vector(&wrong_vec)) {
-            Err(OperationError::WrongVector { .. }) => (),
+            Err(OperationError::WrongVectorDimension { .. }) => (),
             Err(_) => panic!("Wrong error"),
             Ok(_) => panic!("Operation with wrong vector should fail"),
         };
@@ -132,6 +170,7 @@ mod tests {
                 3,
                 1.into(),
                 &json!({ "color": vec!["red".to_owned(), "green".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -140,6 +179,7 @@ mod tests {
                 3,
                 2.into(),
                 &json!({ "color": vec!["red".to_owned(), "blue".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -148,6 +188,7 @@ mod tests {
                 3,
                 3.into(),
                 &json!({ "color": vec!["red".to_owned(), "yellow".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 
@@ -156,6 +197,7 @@ mod tests {
                 3,
                 4.into(),
                 &json!({ "color": vec!["red".to_owned(), "green".to_owned()] }).into(),
+                &None,
             )
             .unwrap();
 

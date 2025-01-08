@@ -1,9 +1,10 @@
 use std::path::Path;
 
 use chrono::{DateTime, SubsecRound, Utc};
+use common::types::{DetailsLevel, TelemetryDetail};
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
 use crate::settings::Settings;
 
@@ -19,15 +20,16 @@ impl AppBuildTelemetryCollector {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct AppFeaturesTelemetry {
     pub debug: bool,
     pub web_feature: bool,
     pub service_debug_feature: bool,
     pub recovery_mode: bool,
+    pub gpu: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct RunningEnvironmentTelemetry {
     distribution: Option<String>,
     distribution_version: Option<String>,
@@ -36,45 +38,46 @@ pub struct RunningEnvironmentTelemetry {
     ram_size: Option<usize>,
     disk_size: Option<usize>,
     cpu_flags: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cpu_endian: Option<CpuEndian>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gpu_devices: Option<Vec<GpuDeviceTelemetry>>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct AppBuildTelemetry {
     pub name: String,
     pub version: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub features: Option<AppFeaturesTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[serde(default)]
     pub system: Option<RunningEnvironmentTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jwt_rbac: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hide_jwt_dashboard: Option<bool>,
     pub startup: DateTime<Utc>,
 }
 
 impl AppBuildTelemetry {
     pub fn collect(
-        level: usize,
+        detail: TelemetryDetail,
         collector: &AppBuildTelemetryCollector,
         settings: &Settings,
     ) -> Self {
         AppBuildTelemetry {
             name: env!("CARGO_PKG_NAME").to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            features: if level > 0 {
-                Some(AppFeaturesTelemetry {
-                    debug: cfg!(debug_assertions),
-                    web_feature: cfg!(feature = "web"),
-                    service_debug_feature: cfg!(feature = "service_debug"),
-                    recovery_mode: settings.storage.recovery_mode.is_some(),
-                })
-            } else {
-                None
-            },
-            system: if level > 0 {
-                Some(get_system_data())
-            } else {
-                None
-            },
+            features: (detail.level >= DetailsLevel::Level1).then(|| AppFeaturesTelemetry {
+                debug: cfg!(debug_assertions),
+                web_feature: cfg!(feature = "web"),
+                service_debug_feature: cfg!(feature = "service_debug"),
+                recovery_mode: settings.storage.recovery_mode.is_some(),
+                gpu: cfg!(feature = "gpu"),
+            }),
+            system: (detail.level >= DetailsLevel::Level1).then(get_system_data),
+            jwt_rbac: settings.service.jwt_rbac,
+            hide_jwt_dashboard: settings.service.hide_jwt_dashboard,
             startup: collector.startup,
         }
     }
@@ -97,6 +100,9 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         if std::arch::is_x86_feature_detected!("sse") {
             cpu_flags.push("sse");
         }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            cpu_flags.push("sse2");
+        }
         if std::arch::is_x86_feature_detected!("avx") {
             cpu_flags.push("avx");
         }
@@ -105,6 +111,9 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         }
         if std::arch::is_x86_feature_detected!("fma") {
             cpu_flags.push("fma");
+        }
+        if std::arch::is_x86_feature_detected!("f16c") {
+            cpu_flags.push("f16c");
         }
         if std::arch::is_x86_feature_detected!("avx512f") {
             cpu_flags.push("avx512f");
@@ -115,7 +124,26 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         if std::arch::is_aarch64_feature_detected!("neon") {
             cpu_flags.push("neon");
         }
+        if std::arch::is_aarch64_feature_detected!("fp16") {
+            cpu_flags.push("fp16");
+        }
     }
+
+    #[cfg(feature = "gpu")]
+    let gpu_devices = segment::index::hnsw_index::gpu::GPU_DEVICES_MANAGER
+        .read()
+        .as_ref()
+        .map(|gpu_devices_manager| {
+            gpu_devices_manager
+                .all_found_device_names()
+                .iter()
+                .map(|name| GpuDeviceTelemetry { name: name.clone() })
+                .collect::<Vec<_>>()
+        });
+
+    #[cfg(not(feature = "gpu"))]
+    let gpu_devices = None;
+
     RunningEnvironmentTelemetry {
         distribution,
         distribution_version,
@@ -124,6 +152,42 @@ fn get_system_data() -> RunningEnvironmentTelemetry {
         ram_size: sys_info::mem_info().ok().map(|x| x.total as usize),
         disk_size: sys_info::disk_info().ok().map(|x| x.total as usize),
         cpu_flags: cpu_flags.join(","),
+        cpu_endian: Some(CpuEndian::current()),
+        gpu_devices,
+    }
+}
+
+#[derive(Serialize, Clone, Copy, Debug, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CpuEndian {
+    Little,
+    Big,
+    Other,
+}
+
+impl CpuEndian {
+    /// Get the current used byte order
+    pub const fn current() -> Self {
+        if cfg!(target_endian = "little") {
+            CpuEndian::Little
+        } else if cfg!(target_endian = "big") {
+            CpuEndian::Big
+        } else {
+            CpuEndian::Other
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug, JsonSchema)]
+pub struct GpuDeviceTelemetry {
+    pub name: String,
+}
+
+impl Anonymize for GpuDeviceTelemetry {
+    fn anonymize(&self) -> Self {
+        GpuDeviceTelemetry {
+            name: self.name.clone(),
+        }
     }
 }
 
@@ -134,6 +198,7 @@ impl Anonymize for AppFeaturesTelemetry {
             web_feature: self.web_feature,
             service_debug_feature: self.service_debug_feature,
             recovery_mode: self.recovery_mode,
+            gpu: self.gpu,
         }
     }
 }
@@ -145,6 +210,8 @@ impl Anonymize for AppBuildTelemetry {
             version: self.version.clone(),
             features: self.features.anonymize(),
             system: self.system.anonymize(),
+            jwt_rbac: self.jwt_rbac,
+            hide_jwt_dashboard: self.hide_jwt_dashboard,
             startup: self.startup.anonymize(),
         }
     }
@@ -160,6 +227,8 @@ impl Anonymize for RunningEnvironmentTelemetry {
             ram_size: self.ram_size.anonymize(),
             disk_size: self.disk_size.anonymize(),
             cpu_flags: self.cpu_flags.clone(),
+            cpu_endian: self.cpu_endian,
+            gpu_devices: self.gpu_devices.anonymize(),
         }
     }
 }

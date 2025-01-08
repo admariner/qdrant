@@ -1,6 +1,8 @@
 use collection::collection::Collection;
-use collection::config::CollectionConfig;
+use collection::common::sha_256::{hash_file, hashes_equal};
+use collection::config::CollectionConfigInternal;
 use collection::operations::snapshot_ops::{SnapshotPriority, SnapshotRecover};
+use collection::operations::verification::new_unchecked_verification_pass;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
 use collection::shards::shard_config::ShardType;
@@ -11,6 +13,7 @@ use crate::content_manager::collection_meta_ops::{
 };
 use crate::content_manager::snapshots::download::download_snapshot;
 use crate::dispatcher::Dispatcher;
+use crate::rbac::{Access, AccessRequirements, CollectionPass};
 use crate::{StorageError, TableOfContent};
 
 pub async fn activate_shard(
@@ -49,67 +52,84 @@ pub async fn do_recover_from_snapshot(
     dispatcher: &Dispatcher,
     collection_name: &str,
     source: SnapshotRecover,
-    wait: bool,
+    access: Access,
+    client: reqwest::Client,
 ) -> Result<bool, StorageError> {
-    let dispatch = dispatcher.clone();
-    let collection_name = collection_name.to_string();
-    let recovery =
-        tokio::spawn(
-            async move { _do_recover_from_snapshot(dispatch, &collection_name, source).await },
-        );
-    if wait {
-        Ok(recovery.await??)
-    } else {
-        Ok(true)
-    }
+    let multipass = access.check_global_access(AccessRequirements::new().manage())?;
+
+    let dispatcher = dispatcher.clone();
+    let collection_pass = multipass.issue_pass(collection_name).into_static();
+
+    let res = tokio::spawn(async move {
+        _do_recover_from_snapshot(dispatcher, access, collection_pass, source, &client).await
+    })
+    .await??;
+
+    Ok(res)
 }
 
 async fn _do_recover_from_snapshot(
     dispatcher: Dispatcher,
-    collection_name: &str,
+    access: Access,
+    collection_pass: CollectionPass<'static>,
     source: SnapshotRecover,
+    client: &reqwest::Client,
 ) -> Result<bool, StorageError> {
-    let SnapshotRecover { location, priority } = source;
-    let toc = dispatcher.toc();
+    let SnapshotRecover {
+        location,
+        priority,
+        checksum,
+        api_key: _,
+    } = source;
+
+    // All checks should've been done at this point.
+    let pass = new_unchecked_verification_pass();
+
+    let toc = dispatcher.toc(&access, &pass);
 
     let this_peer_id = toc.this_peer_id;
 
     let is_distributed = toc.is_distributed();
 
-    let download_dir = toc.snapshots_download_tempdir()?;
-
-    log::debug!(
-        "Downloading snapshot from {} to {}",
+    let snapshot_path = download_snapshot(
+        client,
         location,
-        download_dir.path().display()
-    );
+        &toc.optional_temp_or_snapshot_temp_path()?,
+    )
+    .await?;
 
-    let snapshot_path = download_snapshot(location, download_dir.path()).await?;
+    if let Some(checksum) = checksum {
+        let snapshot_checksum = hash_file(&snapshot_path).await?;
+        if !hashes_equal(&snapshot_checksum, &checksum) {
+            return Err(StorageError::bad_input(format!(
+                "Snapshot checksum mismatch: expected {checksum}, got {snapshot_checksum}"
+            )));
+        }
+    }
 
     log::debug!("Snapshot downloaded to {}", snapshot_path.display());
 
     let temp_storage_path = toc.optional_temp_or_storage_temp_path()?;
 
     let tmp_collection_dir = tempfile::Builder::new()
-        .prefix(&format!("col-{}-recovery-", collection_name))
+        .prefix(&format!("col-{collection_pass}-recovery-"))
         .tempdir_in(temp_storage_path)?;
 
     log::debug!(
-        "Recovering collection {} from snapshot {}",
-        collection_name,
-        snapshot_path.display()
+        "Recovering collection {collection_pass} from snapshot {}",
+        snapshot_path.display(),
     );
 
     log::debug!(
         "Unpacking snapshot to {}",
-        tmp_collection_dir.path().display()
+        tmp_collection_dir.path().display(),
     );
 
     let tmp_collection_dir_clone = tmp_collection_dir.path().to_path_buf();
+    let snapshot_path_clone = snapshot_path.to_path_buf();
     let restoring = tokio::task::spawn_blocking(move || {
-        // Unpack snapshot collection to the target folder
         Collection::restore_snapshot(
-            &snapshot_path,
+            &snapshot_path_clone,
             &tmp_collection_dir_clone,
             this_peer_id,
             is_distributed,
@@ -117,22 +137,22 @@ async fn _do_recover_from_snapshot(
     });
     restoring.await??;
 
-    let snapshot_config = CollectionConfig::load(tmp_collection_dir.path())?;
+    let snapshot_config = CollectionConfigInternal::load(tmp_collection_dir.path())?;
     snapshot_config.validate_and_warn();
 
-    let collection = match toc.get_collection(collection_name).await.ok() {
+    let collection = match toc.get_collection(&collection_pass).await.ok() {
         Some(collection) => collection,
         None => {
-            log::debug!("Collection {} does not exist, creating it", collection_name);
+            log::debug!("Collection {collection_pass} does not exist, creating it");
             let operation =
                 CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
-                    collection_name.to_string(),
+                    collection_pass.to_string(),
                     snapshot_config.clone().into(),
                 ));
             dispatcher
-                .submit_collection_meta_op(operation, None)
+                .submit_collection_meta_op(operation, access, None)
                 .await?;
-            toc.get_collection(collection_name).await?
+            toc.get_collection(&collection_pass).await?
         }
     };
 
@@ -162,7 +182,7 @@ async fn _do_recover_from_snapshot(
             Some(state) => {
                 if state != &ReplicaState::Partial {
                     toc.send_set_replica_state_proposal(
-                        collection_name.to_string(),
+                        collection_pass.to_string(),
                         this_peer_id,
                         *shard_id,
                         ReplicaState::Partial,
@@ -179,17 +199,17 @@ async fn _do_recover_from_snapshot(
     for (shard_id, shard_info) in &state.shards {
         let shards = latest_shard_paths(tmp_collection_dir.path(), *shard_id).await?;
 
-        let snapshot_shard_path = shards
-            .into_iter()
-            .filter_map(
-                |(snapshot_shard_path, _version, shard_type)| match shard_type {
-                    ShardType::Local => Some(snapshot_shard_path),
-                    ShardType::ReplicaSet => Some(snapshot_shard_path),
-                    ShardType::Remote { .. } => None,
-                    ShardType::Temporary => None,
-                },
-            )
-            .next();
+        let snapshot_shard_path =
+            shards
+                .into_iter()
+                .find_map(
+                    |(snapshot_shard_path, _version, shard_type)| match shard_type {
+                        ShardType::Local => Some(snapshot_shard_path),
+                        ShardType::ReplicaSet => Some(snapshot_shard_path),
+                        ShardType::Remote { .. } => None,
+                        ShardType::Temporary => None,
+                    },
+                );
 
         if let Some(snapshot_shard_path) = snapshot_shard_path {
             log::debug!(
@@ -198,12 +218,21 @@ async fn _do_recover_from_snapshot(
                 snapshot_shard_path.display()
             );
 
+            // TODO:
+            //   `_do_recover_from_snapshot` is not *yet* analyzed/organized for cancel safety,
+            //   but `recover_local_shard_from` requires `cancel::CanellationToken` argument *now*,
+            //   so we provide a token that is never triggered (in this case `recover_local_shard_from`
+            //   works *exactly* as before the `cancel::CancellationToken` parameter was added to it)
             let recovered = collection
-                .recover_local_shard_from(&snapshot_shard_path, *shard_id)
+                .recover_local_shard_from(
+                    &snapshot_shard_path,
+                    *shard_id,
+                    cancel::CancellationToken::new(),
+                )
                 .await?;
 
             if !recovered {
-                log::debug!("Shard {} if not in snapshot", shard_id);
+                log::debug!("Shard {} is not in snapshot", shard_id);
                 continue;
             }
 
@@ -212,8 +241,16 @@ async fn _do_recover_from_snapshot(
             let other_active_replicas: Vec<_> = shard_info
                 .replicas
                 .iter()
-                .filter(|(peer_id, state)| {
-                    *state == &ReplicaState::Active && **peer_id != this_peer_id
+                .filter(|&(&peer_id, &state)| {
+                    // Check if there are *other* active replicas, after recovering collection snapshot.
+                    // This should include `ReshardingScaleDown` replicas.
+
+                    let is_active = matches!(
+                        state,
+                        ReplicaState::Active | ReplicaState::ReshardingScaleDown
+                    );
+
+                    peer_id != this_peer_id && is_active
                 })
                 .collect();
 
@@ -243,13 +280,13 @@ async fn _do_recover_from_snapshot(
 
                                 // Don't need more replicas, remove this one
                                 toc.request_remove_replica(
-                                    collection_name.to_string(),
+                                    collection_pass.to_string(),
                                     *shard_id,
                                     *peer_id,
                                 )?;
                             } else {
                                 toc.send_set_replica_state_proposal(
-                                    collection_name.to_string(),
+                                    collection_pass.to_string(),
                                     *peer_id,
                                     *shard_id,
                                     ReplicaState::Dead,
@@ -258,6 +295,7 @@ async fn _do_recover_from_snapshot(
                             }
                         }
                     }
+
                     SnapshotPriority::Replica => {
                         // Replica is the source of truth, we need to sync recovered data with this replica
                         let (replica_peer_id, _state) =
@@ -265,26 +303,41 @@ async fn _do_recover_from_snapshot(
                         log::debug!(
                             "Running synchronization for shard {} of collection {} from {}",
                             shard_id,
-                            collection_name,
+                            collection_pass,
                             replica_peer_id
                         );
 
                         // assume that if there is another peers, the server is distributed
                         toc.request_shard_transfer(
-                            collection_name.to_string(),
+                            collection_pass.to_string(),
                             *shard_id,
                             *replica_peer_id,
                             this_peer_id,
                             true,
+                            None,
                         )?;
                     }
+
+                    // `ShardTransfer` is only used during snapshot *shard transfer*.
+                    // It is only exposed in internal gRPC API and only used for *shard* snapshot recovery.
+                    SnapshotPriority::ShardTransfer => unreachable!(),
                 }
             }
         }
     }
 
+    // Explicitly trigger optimizers for the collection we have recovered. This prevents them from
+    // remaining in grey state if the snapshot is not optimized.
+    // See: <ttps://github.com/qdrant/qdrant/issues/5139>
+    collection.trigger_optimizers().await;
+
     // Remove tmp collection dir
     tokio::fs::remove_dir_all(&tmp_collection_dir).await?;
+
+    // Remove snapshot after recovery if downloaded
+    if let Err(err) = snapshot_path.close() {
+        log::error!("Failed to remove downloaded collection snapshot after recovery: {err}");
+    }
 
     Ok(true)
 }

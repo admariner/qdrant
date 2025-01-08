@@ -44,9 +44,9 @@ def test_triple_replication(tmp_path: pathlib.Path):
     p = processes.pop(killed_id)
     p.kill()
     # Make sure it is completely gone to be able to reuse the data on disk
-    if p.returncode is None:
+    if p.proc.returncode is None:
         print(f"Waiting for leader peer {p.pid} to go down")
-        p.wait()
+        p.proc.wait()
     peer_api_uris.pop(killed_id)
 
     new_url = start_peer(peer_dirs[killed_id], f"peer_{killed_id}_restarted.log", bootstrap_uri)
@@ -66,8 +66,10 @@ def test_triple_replication(tmp_path: pathlib.Path):
         all_active = True
         points_counts = set()
         for peer_api_uri in peer_api_uris:
+            count = get_collection_point_count(peer_api_uri, "test_collection", exact=True)
+            points_counts.add(count)
+
             res = check_collection_cluster(peer_api_uri, "test_collection")
-            points_counts.add(res['points_count'])
             if res['state'] != 'Active':
                 all_active = False
 
@@ -83,8 +85,8 @@ def test_triple_replication(tmp_path: pathlib.Path):
                         f.write(f"{peer_api_uri} {res.json()['result']}\n")
 
                 for peer_api_uri in peer_api_uris:
-                    res = requests.post(f"{peer_api_uri}/collections/test_collection/points/count", json={"exact": True})
-                    print(res.json())
+                    count = get_collection_point_count(peer_api_uri, "test_collection", exact=True)
+                    print(count)
 
                 assert False, f"Points count is not equal on all peers: {points_counts}"
             break

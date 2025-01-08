@@ -1,16 +1,26 @@
 use std::path::{Path, PathBuf};
 
+use collection::common::snapshots_manager::SnapshotStorageManager;
 use collection::operations::snapshot_ops::SnapshotDescription;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::shard::{PeerId, ShardId};
-use collection::shards::transfer::shard_transfer::ShardTransfer;
+use collection::shards::transfer::{ShardTransfer, ShardTransferMethod};
 
 use super::TableOfContent;
 use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus_ops::ConsensusOperations;
 use crate::content_manager::errors::StorageError;
+use crate::rbac::CollectionPass;
 
 impl TableOfContent {
+    pub fn get_snapshots_storage_manager(&self) -> Result<SnapshotStorageManager, StorageError> {
+        SnapshotStorageManager::new(&self.storage_config.snapshots_config).map_err(|err| {
+            StorageError::service_error(format!(
+                "Can't create snapshot storage manager. Error: {err}"
+            ))
+        })
+    }
+
     pub fn snapshots_path(&self) -> &str {
         &self.storage_config.snapshots_path
     }
@@ -44,9 +54,13 @@ impl TableOfContent {
 
     pub async fn create_snapshot(
         &self,
-        collection_name: &str,
+        collection_pass: &CollectionPass<'_>,
     ) -> Result<SnapshotDescription, StorageError> {
-        let collection = self.get_collection(collection_name).await?;
+        // create all the directories of the derived collection snapshot path of
+        // the collection.
+        self.create_snapshots_path(collection_pass.name()).await?;
+
+        let collection = self.get_collection(collection_pass).await?;
         // We want to use temp dir inside the temp_path (storage if not specified), because it is possible, that
         // snapshot directory is mounted as network share and multiple writes to it could be slow
         let temp_dir = self.optional_temp_or_storage_temp_path()?;
@@ -110,13 +124,16 @@ impl TableOfContent {
         from_peer: PeerId,
         to_peer: PeerId,
         sync: bool,
+        method: Option<ShardTransferMethod>,
     ) -> Result<(), StorageError> {
         if let Some(proposal_sender) = &self.consensus_proposal_sender {
             let transfer_request = ShardTransfer {
                 shard_id,
+                to_shard_id: None,
                 from: from_peer,
                 to: to_peer,
                 sync,
+                method,
             };
             let operation = ConsensusOperations::start_transfer(collection_name, transfer_request);
             proposal_sender.send(operation)?;

@@ -1,31 +1,37 @@
-use std::collections::HashMap;
-use std::ops::Deref;
+use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::types::ScoreType;
-use futures::future::try_join_all;
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, TryStreamExt};
 use itertools::Itertools;
 use ordered_float::Float;
-use parking_lot::RwLock;
 use segment::common::operation_error::OperationError;
-use segment::common::BYTES_IN_KB;
 use segment::data_types::named_vectors::NamedVectors;
-use segment::data_types::vectors::QueryVector;
-use segment::entry::entry_point::SegmentEntry;
+use segment::data_types::query_context::{QueryContext, SegmentQueryContext};
+use segment::data_types::vectors::{QueryVector, VectorStructInternal};
 use segment::types::{
     Filter, Indexes, PointIdType, ScoredPoint, SearchParams, SegmentConfig, SeqNumberType,
-    WithPayload, WithPayloadInterface, WithVector, VECTOR_ELEMENT_SIZE,
+    WithPayload, WithPayloadInterface, WithVector,
 };
+use tinyvec::TinyVec;
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
-use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder};
+use super::holders::segment_holder::LockedSegmentHolder;
+use crate::collection_manager::holders::segment_holder::LockedSegment;
 use crate::collection_manager::probabilistic_segment_search_sampling::find_search_sampling_over_point_distribution;
 use crate::collection_manager::search_result_aggregator::BatchResultAggregator;
+use crate::common::stopping_guard::StoppingGuard;
+use crate::config::CollectionConfigInternal;
+use crate::operations::query_enum::QueryEnum;
 use crate::operations::types::{
-    CollectionError, CollectionResult, CoreSearchRequestBatch, QueryEnum, Record,
+    CollectionResult, CoreSearchRequestBatch, Modifier, RecordInternal,
 };
+use crate::optimizers_builder::DEFAULT_INDEXING_THRESHOLD_KB;
 
 type BatchOffset = usize;
 type SegmentOffset = usize;
@@ -44,19 +50,27 @@ type SegmentSearchExecutedResult = CollectionResult<(SegmentBatchSearchResult, V
 pub struct SegmentsSearcher {}
 
 impl SegmentsSearcher {
+    /// Execute searches in parallel and return results in the same order as the searches were provided
     async fn execute_searches(
         searches: Vec<JoinHandle<SegmentSearchExecutedResult>>,
     ) -> CollectionResult<(BatchSearchResult, Vec<Vec<bool>>)> {
-        let searches = try_join_all(searches);
-        let search_results_per_segment_res = searches.await?;
+        let results_len = searches.len();
 
-        let mut search_results_per_segment = vec![];
-        let mut further_searches_per_segment = vec![];
-        for search_result in search_results_per_segment_res {
+        let mut search_results_per_segment_res = FuturesUnordered::new();
+        for (idx, search) in searches.into_iter().enumerate() {
+            // map the result to include the request index for later reordering
+            let result_with_request_index = search.map(move |res| res.map(|s| (idx, s)));
+            search_results_per_segment_res.push(result_with_request_index);
+        }
+
+        let mut search_results_per_segment = vec![Vec::new(); results_len];
+        let mut further_searches_per_segment = vec![Vec::new(); results_len];
+        // process results as they come in and store them in the correct order
+        while let Some((idx, search_result)) = search_results_per_segment_res.try_next().await? {
             let (search_results, further_searches) = search_result?;
             debug_assert!(search_results.len() == further_searches.len());
-            search_results_per_segment.push(search_results);
-            further_searches_per_segment.push(further_searches);
+            search_results_per_segment[idx] = search_results;
+            further_searches_per_segment[idx] = further_searches;
         }
         Ok((search_results_per_segment, further_searches_per_segment))
     }
@@ -72,7 +86,7 @@ impl SegmentsSearcher {
     pub(crate) fn process_search_result_step1(
         search_result: BatchSearchResult,
         limits: Vec<usize>,
-        further_results: Vec<Vec<bool>>,
+        further_results: &[Vec<bool>],
     ) -> (
         BatchResultAggregator,
         HashMap<SegmentOffset, Vec<BatchOffset>>,
@@ -121,7 +135,7 @@ impl SegmentsSearcher {
         let mut searches_to_rerun: HashMap<SegmentOffset, Vec<BatchOffset>> = HashMap::new();
 
         // Check if we want to re-run the search without sampling on some segments
-        for (batch_id, required_limit) in limits.iter().copied().enumerate() {
+        for (batch_id, required_limit) in limits.into_iter().enumerate() {
             let lowest_batch_score_opt = result_aggregator.batch_lowest_scores(batch_id);
 
             // If there are no results, we do not need to re-run the search
@@ -151,14 +165,54 @@ impl SegmentsSearcher {
         (result_aggregator, searches_to_rerun)
     }
 
-    pub async fn search(
-        segments: Arc<RwLock<SegmentHolder>>,
-        batch_request: Arc<CoreSearchRequestBatch>,
-        runtime_handle: &Handle,
-        sampling_enabled: bool,
-        is_stopped: Arc<AtomicBool>,
-        indexing_threshold_kb: usize,
-    ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+    pub async fn prepare_query_context(
+        segments: LockedSegmentHolder,
+        batch_request: &CoreSearchRequestBatch,
+        collection_config: &CollectionConfigInternal,
+        is_stopped_guard: &StoppingGuard,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Option<QueryContext>> {
+        let indexing_threshold_kb = collection_config
+            .optimizer_config
+            .indexing_threshold
+            .unwrap_or(DEFAULT_INDEXING_THRESHOLD_KB);
+        let full_scan_threshold_kb = collection_config.hnsw_config.full_scan_threshold;
+
+        const DEFAULT_CAPACITY: usize = 3;
+        let mut idf_vectors: TinyVec<[&str; DEFAULT_CAPACITY]> = Default::default();
+
+        // check vector names existing
+        for req in &batch_request.searches {
+            let vector_name = req.query.get_vector_name();
+            collection_config.params.get_distance(vector_name)?;
+            if let Some(sparse_vector_params) = collection_config
+                .params
+                .get_sparse_vector_params_opt(vector_name)
+            {
+                if sparse_vector_params.modifier == Some(Modifier::Idf)
+                    && !idf_vectors.contains(&vector_name)
+                {
+                    idf_vectors.push(vector_name);
+                }
+            }
+        }
+
+        let mut query_context = QueryContext::new(
+            indexing_threshold_kb.max(full_scan_threshold_kb),
+            hw_measurement_acc,
+        )
+        .with_is_stopped(is_stopped_guard.get_is_stopped());
+
+        for search_request in &batch_request.searches {
+            search_request
+                .query
+                .iterate_sparse(|vector_name, sparse_vector| {
+                    if idf_vectors.contains(&vector_name) {
+                        query_context.init_idf(vector_name, &sparse_vector.indices);
+                    }
+                })
+        }
+
         // Do blocking calls in a blocking task: `segment.get().read()` calls might block async runtime
         let task = {
             let segments = segments.clone();
@@ -166,28 +220,38 @@ impl SegmentsSearcher {
             tokio::task::spawn_blocking(move || {
                 let segments = segments.read();
 
-                if !segments.is_empty() {
-                    let available_point_count = segments
-                        .iter()
-                        .map(|(_, segment)| segment.get().read().available_point_count())
-                        .sum();
-
-                    Some(available_point_count)
-                } else {
-                    None
+                if segments.is_empty() {
+                    return None;
                 }
+
+                let segments = segments.non_appendable_then_appendable_segments();
+                for locked_segment in segments {
+                    let segment = locked_segment.get();
+                    let segment_guard = segment.read();
+                    segment_guard.fill_query_context(&mut query_context);
+                }
+                Some(query_context)
             })
         };
 
-        let Some(available_point_count) = task.await? else {
-            return Ok(Vec::new());
-        };
+        Ok(task.await?)
+    }
+
+    pub async fn search(
+        segments: LockedSegmentHolder,
+        batch_request: Arc<CoreSearchRequestBatch>,
+        runtime_handle: &Handle,
+        sampling_enabled: bool,
+        query_context: QueryContext,
+    ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        let query_context_arc = Arc::new(query_context);
 
         // Using block to ensure `segments` variable is dropped in the end of it
         let (locked_segments, searches): (Vec<_>, Vec<_>) = {
             // Unfortunately, we have to do `segments.read()` twice, once in blocking task
             // and once here, due to `Send` bounds :/
-            let segments = segments.read();
+            let segments_lock = segments.read();
+            let segments = segments_lock.non_appendable_then_appendable_segments();
 
             // Probabilistic sampling for the `limit` parameter avoids over-fetching points from segments.
             // e.g. 10 segments with limit 1000 would fetch 10000 points in total and discard 9000 points.
@@ -196,26 +260,29 @@ impl SegmentsSearcher {
             // - sampling is enabled
             // - more than 1 segment
             // - segments are not empty
-            let use_sampling = sampling_enabled && segments.len() > 1 && available_point_count > 0;
+            let use_sampling = sampling_enabled
+                && segments_lock.len() > 1
+                && query_context_arc.available_point_count() > 0;
 
             segments
-                .iter()
-                .map(|(_id, segment)| {
+                .map(|segment| {
+                    let query_context_arc_segment = query_context_arc.clone();
+
                     let search = runtime_handle.spawn_blocking({
                         let (segment, batch_request) = (segment.clone(), batch_request.clone());
-                        let is_stopped_clone = is_stopped.clone();
                         move || {
+                            let segment_query_context =
+                                query_context_arc_segment.get_segment_query_context();
+
                             search_in_segment(
                                 segment,
                                 batch_request,
-                                available_point_count,
                                 use_sampling,
-                                &is_stopped_clone,
-                                indexing_threshold_kb,
+                                &segment_query_context,
                             )
                         }
                     });
-                    (segment.clone(), search)
+                    (segment, search)
                 })
                 .unzip()
         };
@@ -233,7 +300,7 @@ impl SegmentsSearcher {
                 .iter()
                 .map(|request| request.limit + request.offset)
                 .collect(),
-            further_results,
+            &further_results,
         );
         // The second step of the search is to re-run the search without sampling on some segments
         // Expected that this stage will be executed rarely
@@ -246,6 +313,7 @@ impl SegmentsSearcher {
             let secondary_searches: Vec<_> = {
                 let mut res = vec![];
                 for (segment_id, batch_ids) in searches_to_rerun.iter() {
+                    let query_context_arc_segment = query_context_arc.clone();
                     let segment = locked_segments[*segment_id].clone();
                     let partial_batch_request = Arc::new(CoreSearchRequestBatch {
                         searches: batch_ids
@@ -253,15 +321,16 @@ impl SegmentsSearcher {
                             .map(|batch_id| batch_request.searches[*batch_id].clone())
                             .collect(),
                     });
-                    let is_stopped_clone = is_stopped.clone();
+
                     res.push(runtime_handle.spawn_blocking(move || {
+                        let segment_query_context =
+                            query_context_arc_segment.get_segment_query_context();
+
                         search_in_segment(
                             segment,
                             partial_batch_request,
-                            0,
                             false,
-                            &is_stopped_clone,
-                            indexing_threshold_kb,
+                            &segment_query_context,
                         )
                     }))
                 }
@@ -290,24 +359,68 @@ impl SegmentsSearcher {
         Ok(top_scores)
     }
 
-    pub fn retrieve(
-        segments: &RwLock<SegmentHolder>,
+    /// Retrieve records for the given points ids from the segments
+    /// - if payload is enabled, payload will be fetched
+    /// - if vector is enabled, vector will be fetched
+    ///
+    /// The points ids can contain duplicates, the records will be fetched only once
+    ///
+    /// If an id is not found in the segments, it won't be included in the output.
+    pub async fn retrieve(
+        segments: LockedSegmentHolder,
         points: &[PointIdType],
         with_payload: &WithPayload,
         with_vector: &WithVector,
-    ) -> CollectionResult<Vec<Record>> {
-        let mut point_version: HashMap<PointIdType, SeqNumberType> = Default::default();
-        let mut point_records: HashMap<PointIdType, Record> = Default::default();
+        runtime_handle: &Handle,
+    ) -> CollectionResult<HashMap<PointIdType, RecordInternal>> {
+        let stopping_guard = StoppingGuard::new();
+        runtime_handle
+            .spawn_blocking({
+                let segments = segments.clone();
+                let points = points.to_vec();
+                let with_payload = with_payload.clone();
+                let with_vector = with_vector.clone();
+                let is_stopped = stopping_guard.get_is_stopped();
+                // TODO create one Task per segment level retrieve
+                move || {
+                    Self::retrieve_blocking(
+                        segments,
+                        &points,
+                        &with_payload,
+                        &with_vector,
+                        &is_stopped,
+                    )
+                }
+            })
+            .await?
+    }
 
-        segments.read().read_points(points, |id, segment| {
-            let version = segment.point_version(id).ok_or_else(|| {
-                OperationError::service_error(format!("No version for point {id}"))
-            })?;
-            // If this point was not found yet or this segment have later version
-            if !point_version.contains_key(&id) || point_version[&id] < version {
+    pub fn retrieve_blocking(
+        segments: LockedSegmentHolder,
+        points: &[PointIdType],
+        with_payload: &WithPayload,
+        with_vector: &WithVector,
+        is_stopped: &AtomicBool,
+    ) -> CollectionResult<HashMap<PointIdType, RecordInternal>> {
+        let mut point_version: HashMap<PointIdType, SeqNumberType> = Default::default();
+        let mut point_records: HashMap<PointIdType, RecordInternal> = Default::default();
+
+        segments
+            .read()
+            .read_points(points, is_stopped, |id, segment| {
+                let version = segment.point_version(id).ok_or_else(|| {
+                    OperationError::service_error(format!("No version for point {id}"))
+                })?;
+
+                // If we already have the latest point version, keep that and continue
+                let version_entry = point_version.entry(id);
+                if matches!(&version_entry, Entry::Occupied(entry) if *entry.get() >= version) {
+                    return Ok(true);
+                }
+
                 point_records.insert(
                     id,
-                    Record {
+                    RecordInternal {
                         id,
                         payload: if with_payload.enable {
                             if let Some(selector) = &with_payload.payload_selector {
@@ -318,26 +431,58 @@ impl SegmentsSearcher {
                         } else {
                             None
                         },
-                        vector: match with_vector {
-                            WithVector::Bool(true) => Some(segment.all_vectors(id)?.into()),
-                            WithVector::Bool(false) => None,
-                            WithVector::Selector(vector_names) => {
-                                let mut selected_vectors = NamedVectors::default();
-                                for vector_name in vector_names {
-                                    if let Some(vector) = segment.vector(vector_name, id)? {
-                                        selected_vectors.insert(vector_name.into(), vector);
-                                    }
+                        vector: {
+                            match with_vector {
+                                WithVector::Bool(true) => {
+                                    Some(VectorStructInternal::from(segment.all_vectors(id)?))
                                 }
-                                Some(selected_vectors.into())
+                                WithVector::Bool(false) => None,
+                                WithVector::Selector(vector_names) => {
+                                    let mut selected_vectors = NamedVectors::default();
+                                    for vector_name in vector_names {
+                                        if let Some(vector) = segment.vector(vector_name, id)? {
+                                            selected_vectors.insert(vector_name.into(), vector);
+                                        }
+                                    }
+                                    Some(VectorStructInternal::from(selected_vectors))
+                                }
                             }
                         },
+                        shard_key: None,
+                        order_value: None,
                     },
                 );
-                point_version.insert(id, version);
-            }
-            Ok(true)
-        })?;
-        Ok(point_records.into_values().collect())
+                *version_entry.or_default() = version;
+
+                Ok(true)
+            })?;
+
+        Ok(point_records)
+    }
+
+    pub async fn read_filtered(
+        segments: LockedSegmentHolder,
+        filter: Option<&Filter>,
+        runtime_handle: &Handle,
+    ) -> CollectionResult<BTreeSet<PointIdType>> {
+        let stopping_guard = StoppingGuard::new();
+        let filter = filter.cloned();
+        runtime_handle
+            .spawn_blocking(move || {
+                let is_stopped = stopping_guard.get_is_stopped();
+                let segments = segments.read();
+                let all_points: BTreeSet<_> = segments
+                    .non_appendable_then_appendable_segments()
+                    .flat_map(|segment| {
+                        segment
+                            .get()
+                            .read()
+                            .read_filtered(None, None, filter.as_ref(), &is_stopped)
+                    })
+                    .collect();
+                Ok(all_points)
+            })
+            .await?
     }
 }
 
@@ -346,6 +491,8 @@ pub enum SearchType {
     #[default]
     Nearest,
     RecommendBestScore,
+    Discover,
+    Context,
 }
 
 impl From<&QueryEnum> for SearchType {
@@ -353,6 +500,8 @@ impl From<&QueryEnum> for SearchType {
         match query {
             QueryEnum::Nearest(_) => Self::Nearest,
             QueryEnum::RecommendBestScore(_) => Self::RecommendBestScore,
+            QueryEnum::Discover(_) => Self::Discover,
+            QueryEnum::Context(_) => Self::Context,
         }
     }
 }
@@ -381,9 +530,12 @@ fn sampling_limit(
     }
     let segment_probability = segment_points as f64 / total_points as f64;
     let poisson_sampling =
-        find_search_sampling_over_point_distribution(limit as f64, segment_probability)
-            .unwrap_or(limit);
-    let effective = effective_limit(limit, ef_limit.unwrap_or(0), poisson_sampling);
+        find_search_sampling_over_point_distribution(limit as f64, segment_probability);
+
+    // if no ef_limit was found, it is a plain index => sampling optimization is not needed.
+    let effective = ef_limit.map_or(limit, |ef_limit| {
+        effective_limit(limit, ef_limit, poisson_sampling)
+    });
     log::trace!("sampling: {effective}, poisson: {poisson_sampling} segment_probability: {segment_probability}, segment_points: {segment_points}, total_points: {total_points}");
     effective
 }
@@ -400,11 +552,8 @@ fn effective_limit(limit: usize, ef_limit: usize, poisson_sampling: usize) -> us
 ///
 /// * `segment` - Locked segment to search in
 /// * `request` - Batch of search requests
-/// * `total_points` - Number of points in all segments combined
 /// * `use_sampling` - If true, try to use probabilistic sampling
-/// * `is_stopped` - Atomic bool to check if search is stopped
-/// * `indexing_threshold` - If `indexed_only` is enabled, the search will skip
-///                          segments with more than this number Kb of un-indexed vectors
+/// * `query_context` - Additional context for the search
 ///
 /// # Returns
 ///
@@ -414,10 +563,8 @@ fn effective_limit(limit: usize, ef_limit: usize, poisson_sampling: usize) -> us
 fn search_in_segment(
     segment: LockedSegment,
     request: Arc<CoreSearchRequestBatch>,
-    total_points: usize,
     use_sampling: bool,
-    is_stopped: &AtomicBool,
-    indexing_threshold_kb: usize,
+    segment_query_context: &SegmentQueryContext,
 ) -> CollectionResult<(Vec<Vec<ScoredPoint>>, Vec<bool>)> {
     let batch_size = request.searches.len();
 
@@ -444,7 +591,7 @@ fn search_in_segment(
 
         let query = search_query.query.clone().into();
 
-        // same params enables batching
+        // same params enables batching (cmp expensive on large filters)
         if params == prev_params {
             vectors_batch.push(query);
         } else {
@@ -456,9 +603,7 @@ fn search_in_segment(
                     &vectors_batch,
                     &prev_params,
                     use_sampling,
-                    total_points,
-                    is_stopped,
-                    indexing_threshold_kb,
+                    segment_query_context,
                 )?;
                 further_results.append(&mut further);
                 result.append(&mut res);
@@ -477,9 +622,7 @@ fn search_in_segment(
             &vectors_batch,
             &prev_params,
             use_sampling,
-            total_points,
-            is_stopped,
-            indexing_threshold_kb,
+            segment_query_context,
         )?;
         further_results.append(&mut further);
         result.append(&mut res);
@@ -490,12 +633,10 @@ fn search_in_segment(
 
 fn execute_batch_search(
     segment: &LockedSegment,
-    vectors_batch: &Vec<QueryVector>,
+    vectors_batch: &[QueryVector],
     search_params: &BatchSearchParams,
     use_sampling: bool,
-    total_points: usize,
-    is_stopped: &AtomicBool,
-    indexing_threshold_kb: usize,
+    segment_query_context: &SegmentQueryContext,
 ) -> CollectionResult<(Vec<Vec<ScoredPoint>>, Vec<bool>)> {
     let locked_segment = segment.get();
     let read_segment = locked_segment.read();
@@ -508,25 +649,16 @@ fn execute_batch_search(
             .params
             .and_then(|p| p.hnsw_ef)
             .or_else(|| get_hnsw_ef_construct(segment_config, search_params.vector_name));
-        sampling_limit(search_params.top, ef_limit, segment_points, total_points)
+        sampling_limit(
+            search_params.top,
+            ef_limit,
+            segment_points,
+            segment_query_context.available_point_count(),
+        )
     } else {
         search_params.top
     };
 
-    let ignore_plain_index = search_params
-        .params
-        .map(|p| p.indexed_only)
-        .unwrap_or(false);
-    if ignore_plain_index
-        && !is_search_optimized(
-            read_segment.deref(),
-            indexing_threshold_kb,
-            search_params.vector_name,
-        )?
-    {
-        let batch_len = vectors_batch.len();
-        return Ok((vec![vec![]; batch_len], vec![false; batch_len]));
-    }
     let vectors_batch = &vectors_batch.iter().collect_vec();
     let res = read_segment.search_batch(
         search_params.vector_name,
@@ -536,7 +668,7 @@ fn execute_batch_search(
         search_params.filter,
         top,
         search_params.params,
-        is_stopped,
+        segment_query_context,
     )?;
 
     let further_results = res
@@ -545,53 +677,6 @@ fn execute_batch_search(
         .collect();
 
     Ok((res, further_results))
-}
-
-/// Check if the segment is indexed enough to be searched with `indexed_only` parameter
-fn is_search_optimized(
-    segment: &dyn SegmentEntry,
-    indexing_threshold_kb: usize,
-    vector_name: &str,
-) -> CollectionResult<bool> {
-    let segment_info = segment.info();
-    let vector_name_error =
-        || CollectionError::bad_request(format!("Vector {} doesn't exist", vector_name));
-
-    let vector_data_info = segment_info
-        .vector_data
-        .get(vector_name)
-        .ok_or_else(vector_name_error)?;
-
-    let vector_size = segment
-        .config()
-        .vector_data
-        .get(vector_name)
-        .ok_or_else(vector_name_error)?
-        .size;
-
-    let vector_size_bytes = vector_size * VECTOR_ELEMENT_SIZE;
-
-    let unindexed_vectors = vector_data_info
-        .num_vectors
-        .saturating_sub(vector_data_info.num_indexed_vectors);
-
-    let unindexed_volume = vector_size_bytes.saturating_mul(unindexed_vectors);
-
-    let indexing_threshold_bytes = indexing_threshold_kb * BYTES_IN_KB;
-
-    // Examples:
-    // Threshold = 20_000 Kb
-    // Indexed vectors: 100000
-    // Total vectors: 100010
-    // unindexed_volume = 100010 - 100000 = 10
-    // Result: true
-
-    // Threshold = 20_000 Kb
-    // Indexed vectors: 0
-    // Total vectors: 100000
-    // unindexed_volume = 100000
-    // Result: false
-    Ok(unindexed_volume < indexing_threshold_bytes)
 }
 
 /// Find the HNSW ef_construct for a named vector
@@ -610,15 +695,19 @@ fn get_hnsw_ef_construct(config: &SegmentConfig, vector_name: &str) -> Option<us
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
+    use api::rest::SearchRequestInternal;
+    use parking_lot::RwLock;
     use segment::fixtures::index_fixtures::random_vector;
-    use segment::types::SegmentType;
+    use segment::index::VectorIndexEnum;
+    use segment::types::{Condition, HasIdCondition};
     use tempfile::Builder;
 
     use super::*;
-    use crate::collection_manager::fixtures::{
-        build_test_holder, optimize_segment, random_segment,
-    };
-    use crate::operations::types::{CoreSearchRequest, SearchRequest};
+    use crate::collection_manager::fixtures::{build_test_holder, random_segment};
+    use crate::collection_manager::holders::segment_holder::SegmentHolder;
+    use crate::operations::types::CoreSearchRequest;
     use crate::optimizers_builder::DEFAULT_INDEXING_THRESHOLD_KB;
 
     #[test]
@@ -627,27 +716,27 @@ mod tests {
 
         let segment1 = random_segment(dir.path(), 10, 200, 256);
 
-        let res_1 = is_search_optimized(&segment1, 25, "").unwrap();
+        let vector_index = segment1.vector_data.get("").unwrap().vector_index.clone();
 
-        assert!(!res_1);
+        let vector_index_borrow = vector_index.borrow();
 
-        let res_2 = is_search_optimized(&segment1, 225, "").unwrap();
+        match &*vector_index_borrow {
+            VectorIndexEnum::Plain(plain_index) => {
+                let res_1 = plain_index.is_small_enough_for_unindexed_search(25, None);
+                assert!(!res_1);
 
-        assert!(res_2);
+                let res_2 = plain_index.is_small_enough_for_unindexed_search(225, None);
+                assert!(res_2);
 
-        let indexed_segment = optimize_segment(segment1);
+                let ids: HashSet<_> = vec![1, 2].into_iter().map(PointIdType::from).collect();
 
-        let indexed_segment_get = indexed_segment.get();
-        let indexed_segment_read = indexed_segment_get.read();
+                let ids_filter = Filter::new_must(Condition::HasId(HasIdCondition::from(ids)));
 
-        assert_eq!(
-            indexed_segment_read.info().segment_type,
-            SegmentType::Indexed
-        );
-
-        let res_3 = is_search_optimized(indexed_segment_read.deref(), 25, "").unwrap();
-
-        assert!(res_3);
+                let res_3 = plain_index.is_small_enough_for_unindexed_search(25, Some(&ids_filter));
+                assert!(res_3);
+            }
+            _ => panic!("Expected plain index"),
+        }
     }
 
     #[tokio::test]
@@ -673,13 +762,13 @@ mod tests {
             searches: vec![req],
         };
 
+        let hw_acc = HwMeasurementAcc::new();
         let result = SegmentsSearcher::search(
             Arc::new(segment_holder),
             Arc::new(batch_request),
             &Handle::current(),
             true,
-            Arc::new(AtomicBool::new(false)),
-            DEFAULT_INDEXING_THRESHOLD_KB,
+            QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_acc),
         )
         .await
         .unwrap()
@@ -704,28 +793,28 @@ mod tests {
 
         let mut holder = SegmentHolder::default();
 
-        let _sid1 = holder.add(segment1);
-        let _sid2 = holder.add(segment2);
+        let _sid1 = holder.add_new(segment1);
+        let _sid2 = holder.add_new(segment2);
 
         let segment_holder = Arc::new(RwLock::new(holder));
 
         let mut rnd = rand::thread_rng();
 
         for _ in 0..100 {
-            let req1 = SearchRequest {
+            let req1 = SearchRequestInternal {
                 vector: random_vector(&mut rnd, 4).into(),
                 limit: 150, // more than LOWER_SEARCH_LIMIT_SAMPLING
-                offset: 0,
+                offset: None,
                 with_payload: None,
                 with_vector: None,
                 filter: None,
                 params: None,
                 score_threshold: None,
             };
-            let req2 = SearchRequest {
+            let req2 = SearchRequestInternal {
                 vector: random_vector(&mut rnd, 4).into(),
                 limit: 50, // less than LOWER_SEARCH_LIMIT_SAMPLING
-                offset: 0,
+                offset: None,
                 filter: None,
                 params: None,
                 with_payload: None,
@@ -739,16 +828,25 @@ mod tests {
 
             let batch_request = Arc::new(batch_request);
 
+            let hw_measurement_acc = HwMeasurementAcc::new();
+            let query_context =
+                QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_measurement_acc.clone());
+
             let result_no_sampling = SegmentsSearcher::search(
                 segment_holder.clone(),
                 batch_request.clone(),
                 &Handle::current(),
                 false,
-                Arc::new(false.into()),
-                DEFAULT_INDEXING_THRESHOLD_KB,
+                query_context,
             )
             .await
             .unwrap();
+
+            assert_ne!(hw_measurement_acc.get_cpu(), 0);
+
+            let hw_measurement_acc = HwMeasurementAcc::new();
+            let query_context =
+                QueryContext::new(DEFAULT_INDEXING_THRESHOLD_KB, hw_measurement_acc.clone());
 
             assert!(!result_no_sampling.is_empty());
 
@@ -757,12 +855,13 @@ mod tests {
                 batch_request,
                 &Handle::current(),
                 true,
-                Arc::new(false.into()),
-                DEFAULT_INDEXING_THRESHOLD_KB,
+                query_context,
             )
             .await
             .unwrap();
             assert!(!result_sampling.is_empty());
+
+            assert_ne!(hw_measurement_acc.get_cpu(), 0);
 
             // assert equivalence in depth
             assert_eq!(result_no_sampling[0].len(), result_sampling[0].len());
@@ -780,12 +879,12 @@ mod tests {
     fn test_retrieve() {
         let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
         let segment_holder = build_test_holder(dir.path());
-
-        let records = SegmentsSearcher::retrieve(
-            &segment_holder,
+        let records = SegmentsSearcher::retrieve_blocking(
+            Arc::new(segment_holder),
             &[1.into(), 2.into(), 3.into()],
             &WithPayload::from(true),
             &true.into(),
+            &AtomicBool::new(false),
         )
         .unwrap();
         assert_eq!(records.len(), 3);
@@ -793,7 +892,7 @@ mod tests {
 
     #[test]
     fn test_sampling_limit() {
-        assert_eq!(sampling_limit(1000, None, 464530, 35103551), 30);
+        assert_eq!(sampling_limit(1000, None, 464530, 35103551), 1000);
     }
 
     #[test]

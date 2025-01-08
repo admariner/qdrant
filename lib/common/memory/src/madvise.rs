@@ -1,7 +1,9 @@
 //! Platform-independent abstractions over [`memmap2::Mmap::advise`]/[`memmap2::MmapMut::advise`]
 //! and [`memmap2::Advice`].
 
+use std::hint::black_box;
 use std::io;
+use std::num::Wrapping;
 
 use serde::Deserialize;
 
@@ -61,6 +63,32 @@ impl From<Advice> for memmap2::Advice {
     }
 }
 
+/// Either the global [`Advice`] value or a specific [`Advice`] value.
+#[derive(Copy, Clone, Debug)]
+pub enum AdviceSetting {
+    /// Use the global [`Advice`] value (see [`set_global`] and [`get_global`]).
+    Global,
+
+    /// Use the specific [`Advice`] value.
+    Advice(Advice),
+}
+
+impl From<Advice> for AdviceSetting {
+    fn from(advice: Advice) -> Self {
+        AdviceSetting::Advice(advice)
+    }
+}
+
+impl AdviceSetting {
+    /// Get the specific [`Advice`] value.
+    pub fn resolve(self) -> Advice {
+        match self {
+            AdviceSetting::Global => get_global(),
+            AdviceSetting::Advice(advice) => advice,
+        }
+    }
+}
+
 /// Advise OS how given memory map will be accessed. On non-Unix platforms this is a no-op.
 pub fn madvise(madviseable: &impl Madviseable, advice: Advice) -> io::Result<()> {
     madviseable.madvise(advice)
@@ -71,6 +99,8 @@ pub fn madvise(madviseable: &impl Madviseable, advice: Advice) -> io::Result<()>
 pub trait Madviseable {
     /// Advise OS how given memory map will be accessed. On non-Unix platforms this is a no-op.
     fn madvise(&self, advice: Advice) -> io::Result<()>;
+
+    fn populate(&self);
 }
 
 impl Madviseable for memmap2::Mmap {
@@ -80,6 +110,20 @@ impl Madviseable for memmap2::Mmap {
         #[cfg(not(unix))]
         log::debug!("Ignore {advice:?} on this platform");
         Ok(())
+    }
+
+    fn populate(&self) {
+        #[cfg(target_os = "linux")]
+        if *POPULATE_READ_IS_SUPPORTED {
+            match self.advise(memmap2::Advice::PopulateRead) {
+                Ok(()) => return,
+                Err(err) => log::warn!(
+                    "Failed to populate with MADV_POPULATE_READ: {err}. \
+                     Falling back to naive approach."
+                ),
+            }
+        }
+        populate_simple(self);
     }
 }
 
@@ -91,4 +135,37 @@ impl Madviseable for memmap2::MmapMut {
         log::debug!("Ignore {advice:?} on this platform");
         Ok(())
     }
+
+    fn populate(&self) {
+        #[cfg(target_os = "linux")]
+        if *POPULATE_READ_IS_SUPPORTED {
+            match self.advise(memmap2::Advice::PopulateRead) {
+                Ok(()) => return,
+                Err(err) => log::warn!(
+                    "Failed to populate with MADV_POPULATE_READ: {err}. \
+                     Falling back to naive approach."
+                ),
+            }
+        }
+        populate_simple(self);
+    }
+}
+
+/// True if `MADV_POPULATE_READ` is supported (added in Linux 5.14).
+#[cfg(target_os = "linux")]
+static POPULATE_READ_IS_SUPPORTED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| memmap2::Advice::PopulateRead.is_supported());
+
+/// On older Linuxes and non-Unix platforms, we just read every 512th byte to
+/// populate the page cache. This is not as efficient as `madvise(2)` with
+/// `MADV_POPULATE_READ` but it's better than nothing.
+fn populate_simple(slice: &[u8]) {
+    black_box(
+        slice
+            .iter()
+            .copied()
+            .map(Wrapping)
+            .step_by(512)
+            .sum::<Wrapping<u8>>(),
+    );
 }

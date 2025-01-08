@@ -1,0 +1,19 @@
+[package]
+name = "dataset"
+version = "0.0.0"
+authors = [
+    "Andrey Vasnetsov <andrey@qdrant.com>",
+    "Qdrant Team <info@qdrant.tech>",
+]
+license = "Apache-2.0"
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = "1.0.95"
+flate2 = { version = "1.0.35" }
+indicatif = { workspace = true }
+reqwest = { workspace = true }

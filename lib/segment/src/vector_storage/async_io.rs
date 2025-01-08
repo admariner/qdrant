@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::File;
 use std::os::fd::AsRawFd;
 
@@ -6,10 +7,11 @@ use io_uring::{opcode, types, IoUring};
 use memory::mmap_ops::transmute_from_u8_to_slice;
 
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::data_types::vectors::VectorElementType;
+use crate::data_types::primitive::PrimitiveVectorElement;
 
 const DISK_PARALLELISM: usize = 16; // TODO: benchmark it better, or make it configurable
 
+#[derive(Debug)]
 struct BufferMeta {
     /// Sequential index of the processing point
     pub index: usize,
@@ -17,6 +19,7 @@ struct BufferMeta {
     pub point_id: PointOffsetType,
 }
 
+#[derive(Debug)]
 struct Buffer {
     /// Stores the buffer for the point vectors
     pub buffer: Vec<u8>,
@@ -24,6 +27,7 @@ struct Buffer {
     pub meta: Option<BufferMeta>,
 }
 
+#[derive(Debug)]
 struct BufferStore {
     /// Stores the buffer for the point vectors
     pub buffers: Vec<Buffer>,
@@ -40,22 +44,30 @@ impl BufferStore {
                 .collect(),
         }
     }
-
-    #[allow(dead_code)]
-    pub fn new_empty() -> Self {
-        Self { buffers: vec![] }
-    }
 }
 
-pub struct UringReader {
+pub struct UringReader<T: PrimitiveVectorElement> {
     file: File,
     buffers: BufferStore,
     io_uring: Option<IoUring>,
     raw_size: usize,
     header_size: usize,
+    _phantom: std::marker::PhantomData<T>,
 }
 
-impl UringReader {
+impl<T: PrimitiveVectorElement> fmt::Debug for UringReader<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VectorData")
+            .field("file", &self.file)
+            .field("buffers", &self.buffers)
+            .field("raw_size", &self.raw_size)
+            .field("header_size", &self.header_size)
+            .field("_phantom", &self._phantom)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T: PrimitiveVectorElement> UringReader<T> {
     pub fn new(file: File, raw_size: usize, header_size: usize) -> OperationResult<Self> {
         let buffers = BufferStore::new(DISK_PARALLELISM, raw_size);
         let io_uring = IoUring::new(DISK_PARALLELISM as _)?;
@@ -66,6 +78,7 @@ impl UringReader {
             io_uring: Some(io_uring),
             raw_size,
             header_size,
+            _phantom: std::marker::PhantomData,
         })
     }
 
@@ -73,7 +86,7 @@ impl UringReader {
     pub fn read_stream(
         &mut self,
         points: impl IntoIterator<Item = PointOffsetType>,
-        mut callback: impl FnMut(usize, PointOffsetType, &[VectorElementType]),
+        mut callback: impl FnMut(usize, PointOffsetType, &[T]),
     ) -> OperationResult<()> {
         // Take `UringReader::io_uring`, so that if we return an error or panic during `read_stream`,
         // `IoUring` would be transparently dropped.
@@ -124,7 +137,7 @@ impl UringReader {
             unsafe {
                 // self.io_uring.submission().push(&read_e).unwrap();
                 io_uring.submission().push(&read_e).map_err(|err| {
-                    OperationError::service_error(format!("Failed using io-uring: {}", err))
+                    OperationError::service_error(format!("Failed using io-uring: {err}"))
                 })?;
             }
         }
@@ -149,11 +162,11 @@ impl UringReader {
     }
 }
 
-fn submit_and_read(
+fn submit_and_read<T: PrimitiveVectorElement>(
     io_uring: &mut IoUring,
     buffers: &mut BufferStore,
     unused_buffer_ids: &mut Vec<usize>,
-    mut callback: impl FnMut(usize, PointOffsetType, &[VectorElementType]),
+    mut callback: impl FnMut(usize, PointOffsetType, &[T]),
     raw_size: usize,
 ) -> OperationResult<()> {
     let buffers_count = buffers.buffers.len();
@@ -167,13 +180,11 @@ fn submit_and_read(
         let result = entry.result();
         if result < 0 {
             return Err(OperationError::service_error(format!(
-                "io_uring operation failed with {} error",
-                result
+                "io_uring operation failed with {result} error"
             )));
         } else if (result as usize) != raw_size {
             return Err(OperationError::service_error(format!(
-                "io_uring operation returned {} bytes instead of {}",
-                result, raw_size
+                "io_uring operation returned {result} bytes instead of {raw_size}"
             )));
         }
 

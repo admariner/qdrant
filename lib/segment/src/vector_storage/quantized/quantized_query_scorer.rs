@@ -1,58 +1,116 @@
+use std::borrow::Cow;
+use std::marker::PhantomData;
+
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
 
-use crate::data_types::vectors::{VectorElementType, VectorType};
-use crate::types::Distance;
+use crate::data_types::primitive::PrimitiveVectorElement;
+use crate::data_types::vectors::{DenseVector, MultiDenseVectorInternal};
+use crate::spaces::metric::Metric;
+use crate::types::QuantizationConfig;
+use crate::vector_storage::common::VECTOR_READ_BATCH_SIZE;
 use crate::vector_storage::query_scorer::QueryScorer;
 
-pub struct QuantizedQueryScorer<'a, TEncodedQuery, TEncodedVectors>
+pub struct QuantizedQueryScorer<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors>
 where
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
     TEncodedVectors: quantization::EncodedVectors<TEncodedQuery>,
 {
-    original_query: VectorType,
     query: TEncodedQuery,
     quantized_data: &'a TEncodedVectors,
-    distance: Distance,
+    metric: PhantomData<TMetric>,
+    element: PhantomData<TElement>,
+    hardware_counter: HardwareCounterCell,
 }
 
-impl<'a, TEncodedQuery, TEncodedVectors> QuantizedQueryScorer<'a, TEncodedQuery, TEncodedVectors>
+impl<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors>
+    QuantizedQueryScorer<'a, TElement, TMetric, TEncodedQuery, TEncodedVectors>
 where
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
     TEncodedVectors: quantization::EncodedVectors<TEncodedQuery>,
 {
     pub fn new(
-        raw_query: VectorType,
+        raw_query: DenseVector,
         quantized_data: &'a TEncodedVectors,
-        distance: Distance,
+        quantization_config: &QuantizationConfig,
+        hardware_counter: HardwareCounterCell,
     ) -> Self {
-        let original_query = distance.preprocess_vector(raw_query);
-        let query = quantized_data.encode_query(&original_query);
+        let raw_preprocessed_query = TMetric::preprocess(raw_query);
+        let original_query = TElement::slice_from_float_cow(Cow::Owned(raw_preprocessed_query));
+        let original_query_prequantized = TElement::quantization_preprocess(
+            quantization_config,
+            TMetric::distance(),
+            original_query.as_ref(),
+        );
+        let query = quantized_data.encode_query(&original_query_prequantized);
 
         Self {
-            original_query,
             query,
             quantized_data,
-            distance,
+            metric: PhantomData,
+            element: PhantomData,
+            hardware_counter,
+        }
+    }
+
+    pub fn new_multi(
+        raw_query: &MultiDenseVectorInternal,
+        quantized_data: &'a TEncodedVectors,
+        quantization_config: &QuantizationConfig,
+        hardware_counter: HardwareCounterCell,
+    ) -> Self {
+        let mut query = Vec::new();
+        for inner_vector in raw_query.multi_vectors() {
+            let inner_preprocessed = TMetric::preprocess(inner_vector.to_vec());
+            let inner_converted = TElement::slice_from_float_cow(Cow::Owned(inner_preprocessed));
+            let inner_prequantized = TElement::quantization_preprocess(
+                quantization_config,
+                TMetric::distance(),
+                inner_converted.as_ref(),
+            );
+            query.extend_from_slice(&inner_prequantized);
+        }
+
+        let query = quantized_data.encode_query(&query);
+
+        Self {
+            query,
+            quantized_data,
+            metric: PhantomData,
+            element: PhantomData,
+            hardware_counter,
         }
     }
 }
-
-impl<TEncodedQuery, TEncodedVectors> QueryScorer
-    for QuantizedQueryScorer<'_, TEncodedQuery, TEncodedVectors>
+impl<TElement, TMetric, TEncodedQuery, TEncodedVectors> QueryScorer<[TElement]>
+    for QuantizedQueryScorer<'_, TElement, TMetric, TEncodedQuery, TEncodedVectors>
 where
+    TElement: PrimitiveVectorElement,
+    TMetric: Metric<TElement>,
     TEncodedVectors: quantization::EncodedVectors<TEncodedQuery>,
 {
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
-        self.quantized_data.score_point(&self.query, idx)
+        self.quantized_data
+            .score_point(&self.query, idx, &self.hardware_counter)
     }
 
-    fn score(&self, v2: &[VectorElementType]) -> ScoreType {
-        debug_assert!(
-            false,
-            "This method is not expected to be called for quantized scorer"
-        );
-        self.distance.similarity(&self.original_query, v2)
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert!(ids.len() <= VECTOR_READ_BATCH_SIZE);
+        debug_assert_eq!(ids.len(), scores.len());
+        // no specific implementation for batch scoring
+        for (idx, id) in ids.iter().enumerate() {
+            scores[idx] = self.score_stored(*id);
+        }
+    }
+
+    fn score(&self, _v2: &[TElement]) -> ScoreType {
+        unimplemented!("This method is not expected to be called for quantized scorer");
     }
 
     fn score_internal(&self, point_a: PointOffsetType, point_b: PointOffsetType) -> ScoreType {
-        self.quantized_data.score_internal(point_a, point_b)
+        self.quantized_data
+            .score_internal(point_a, point_b, &self.hardware_counter)
     }
 }

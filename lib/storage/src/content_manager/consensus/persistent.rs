@@ -1,4 +1,5 @@
 use std::cmp;
+use std::collections::HashMap;
 use std::fs::{create_dir_all, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use atomicwrites::{AllowOverwrite, AtomicFile};
+use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
 use http::Uri;
 use parking_lot::RwLock;
@@ -14,7 +16,7 @@ use raft::RaftState;
 use serde::{Deserialize, Serialize};
 
 use crate::content_manager::consensus::entry_queue::{EntryApplyProgressQueue, EntryId};
-use crate::types::PeerAddressById;
+use crate::types::{PeerAddressById, PeerMetadataById};
 use crate::StorageError;
 
 // Deprecated, use `STATE_FILE_NAME` instead
@@ -33,12 +35,18 @@ pub struct Persistent {
     /// for this last snapshot ID (term + commit)
     #[serde(default)] // TODO quick fix to avoid breaking the compat. with 0.8.1
     pub latest_snapshot_meta: SnapshotMetadataSer,
-    /// Operations to applied, consensus consider them committed, but this peer didn't apply them yet
+    /// Operations to be applied, consensus considers them committed, but this peer didn't apply them yet
     #[serde(default)]
     pub apply_progress_queue: EntryApplyProgressQueue,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_voter: Option<PeerId>,
     /// Last known cluster topology
     #[serde(with = "serialize_peer_addresses")]
     pub peer_address_by_id: Arc<RwLock<PeerAddressById>>,
+    #[serde(default)]
+    pub peer_metadata_by_id: Arc<RwLock<PeerMetadataById>>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub cluster_metadata: HashMap<String, serde_json::Value>,
     pub this_peer_id: PeerId,
     #[serde(skip)]
     pub path: PathBuf,
@@ -60,8 +68,10 @@ impl Persistent {
         &mut self,
         meta: &SnapshotMetadata,
         address_by_id: PeerAddressById,
+        metadata_by_id: PeerMetadataById,
     ) -> Result<(), StorageError> {
         *self.peer_address_by_id.write() = address_by_id;
+        *self.peer_metadata_by_id.write() = metadata_by_id;
         self.state.conf_state = meta.get_conf_state().clone();
         self.state.hard_state.term = cmp::max(self.state.hard_state.term, meta.term);
         self.state.hard_state.commit = meta.index;
@@ -74,23 +84,46 @@ impl Persistent {
     pub fn load_or_init(
         storage_path: impl AsRef<Path>,
         first_peer: bool,
+        reinit: bool,
     ) -> Result<Self, StorageError> {
         create_dir_all(storage_path.as_ref())?;
         let path_legacy = storage_path.as_ref().join(STATE_FILE_NAME_CBOR);
         let path_json = storage_path.as_ref().join(STATE_FILE_NAME);
-        let state = if path_json.exists() {
+        let mut state = if path_json.exists() {
             log::info!("Loading raft state from {}", path_json.display());
-            Self::load_json(path_json)?
+            Self::load_json(path_json.clone())?
         } else if path_legacy.exists() {
             log::info!("Loading raft state from {}", path_legacy.display());
             let mut state = Self::load(path_legacy)?;
             // migrate to json
-            state.path = path_json;
+            state.path = path_json.clone();
             state.save()?;
             state
         } else {
             log::info!("Initializing new raft state at {}", path_json.display());
-            Self::init(path_json, first_peer)?
+            Self::init(path_json.clone(), first_peer, None)?
+        };
+
+        let state = if reinit {
+            if first_peer {
+                // Re-initialize consensus of the first peer is different from the rest
+                // Effectively, we should remove all other peers from voters and learners
+                // assuming that other peers would need to join consensus again.
+                // PeerId if the current peer should stay in the list of voters,
+                // so we can accept consensus operations.
+                state.state.conf_state.voters = vec![state.this_peer_id];
+                state.state.conf_state.learners = vec![];
+                state.state.hard_state.vote = state.this_peer_id;
+                state.save()?;
+                state
+            } else {
+                // We want to re-initialize consensus while preserve the peer ID
+                // which is needed for migration from one cluster to another
+                let keep_peer_id = state.this_peer_id;
+                Self::init(path_json, first_peer, Some(keep_peer_id))?
+            }
+        } else {
+            state
         };
 
         log::debug!("State: {:?}", state);
@@ -138,24 +171,97 @@ impl Persistent {
     }
 
     pub fn insert_peer(&mut self, peer_id: PeerId, address: Uri) -> Result<(), StorageError> {
-        if let Some(prev_peer_address) = self
+        let address_display = address.to_string();
+        match self
             .peer_address_by_id
             .write()
             .insert(peer_id, address.clone())
         {
-            log::warn!("Replaced address of peer {peer_id} from {prev_peer_address} to {address}");
-        } else {
-            log::debug!("Added peer with id {peer_id} and address {address}")
+            Some(prev_address) if prev_address != address => log::warn!(
+                "Replaced address of peer {peer_id} from {prev_address} to {address_display}"
+            ),
+            Some(_) => log::debug!(
+                "Re-added peer with id {peer_id} with the same address {address_display}"
+            ),
+            None => log::debug!("Added peer with id {peer_id} and address {address_display}"),
         }
         self.save()
+    }
+
+    pub fn update_peer_metadata(
+        &mut self,
+        peer_id: PeerId,
+        metadata: PeerMetadata,
+    ) -> Result<(), StorageError> {
+        if let Some(prev_metadata) = self
+            .peer_metadata_by_id
+            .write()
+            .insert(peer_id, metadata.clone())
+        {
+            log::info!(
+                "Replaced metadata of peer {peer_id} from {prev_metadata:?} to {metadata:?}"
+            );
+        } else {
+            log::debug!("Added metadata for peer with id {peer_id}: {metadata:?}")
+        }
+        self.save()
+    }
+
+    pub fn get_cluster_metadata_keys(&self) -> Vec<String> {
+        self.cluster_metadata.keys().cloned().collect()
+    }
+
+    pub fn get_cluster_metadata_key(&self, key: &str) -> serde_json::Value {
+        self.cluster_metadata
+            .get(key)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    pub fn update_cluster_metadata_key(&mut self, key: String, value: serde_json::Value) {
+        if !value.is_null() {
+            self.cluster_metadata.insert(key, value);
+        } else {
+            self.cluster_metadata.remove(&key);
+        }
     }
 
     pub fn last_applied_entry(&self) -> Option<u64> {
         self.apply_progress_queue.get_last_applied()
     }
 
+    /// Get the last applied commit and term, reflected in our current state.
+    pub fn applied_commit_term(&self) -> (u64, u64) {
+        let hard_state = &self.state().hard_state;
+
+        // Fall back to 0 because it's always less than any commit
+        let last_commit = self.last_applied_entry().unwrap_or(0);
+
+        (last_commit, hard_state.term)
+    }
+
+    pub fn first_voter(&self) -> Option<PeerId> {
+        self.first_voter
+    }
+
+    pub fn set_first_voter(&mut self, id: PeerId) -> Result<(), StorageError> {
+        self.first_voter = Some(id);
+        self.save()
+    }
+
     pub fn peer_address_by_id(&self) -> PeerAddressById {
         self.peer_address_by_id.read().clone()
+    }
+
+    pub fn peer_metadata_by_id(&self) -> PeerMetadataById {
+        self.peer_metadata_by_id.read().clone()
+    }
+
+    pub fn is_our_metadata_outdated(&self) -> bool {
+        self.peer_metadata_by_id
+            .read()
+            .get(&self.this_peer_id())
+            .map_or(true, |metadata| metadata.is_different_version())
     }
 
     pub fn this_peer_id(&self) -> PeerId {
@@ -167,10 +273,14 @@ impl Persistent {
     ///
     /// `first_peer` - if this is a first peer in a new deployment (e.g. it does not bootstrap from anyone)
     /// It is `None` if distributed deployment is disabled
-    fn init(path: PathBuf, first_peer: bool) -> Result<Self, StorageError> {
+    fn init(
+        path: PathBuf,
+        first_peer: bool,
+        this_peer_id: Option<PeerId>,
+    ) -> Result<Self, StorageError> {
         // Do not generate too big peer ID, to avoid problems with serialization
         // (especially in json format)
-        let this_peer_id = rand::random::<PeerId>() % (1 << 53);
+        let this_peer_id = this_peer_id.unwrap_or_else(|| rand::random::<PeerId>() % (1 << 53));
         let voters = if first_peer {
             vec![this_peer_id]
         } else {
@@ -187,7 +297,10 @@ impl Persistent {
                 conf_state: ConfState::from((voters, vec![])),
             },
             apply_progress_queue: Default::default(),
+            first_voter: if first_peer { Some(this_peer_id) } else { None },
             peer_address_by_id: Default::default(),
+            peer_metadata_by_id: Default::default(),
+            cluster_metadata: Default::default(),
             this_peer_id,
             path,
             latest_snapshot_meta: Default::default(),

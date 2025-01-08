@@ -29,28 +29,30 @@ And once you need a fine-grained setup, you can also define a storage path and c
 ```bash
 docker run -p 6333:6333 \
     -v $(pwd)/path/to/data:/qdrant/storage \
+    -v $(pwd)/path/to/snapshots:/qdrant/snapshots \
     -v $(pwd)/path/to/custom_config.yaml:/qdrant/config/production.yaml \
     qdrant/qdrant
 ```
 
-* `/qdrant/storage` - is a place where Qdrant persists all your data. 
-Make sure to mount it as a volume, otherwise docker will drop it with the container. 
-* `/qdrant/config/production.yaml` - is the file with engine configuration. You can override any value from the [reference config](https://github.com/qdrant/qdrant/blob/master/config/config.yaml) 
+* `/qdrant/storage` - is the place where Qdrant persists all your data.
+Make sure to mount it as a volume, otherwise docker will drop it with the container.
+- `/qdrant/snapshots` - is the place where Qdrant stores [snapshots](https://qdrant.tech/documentation/concepts/snapshots/)
+* `/qdrant/config/production.yaml` - is the file with engine configuration. You can override any value from the [reference config](https://github.com/qdrant/qdrant/blob/master/config/config.yaml)
 
 Now Qdrant should be accessible at [localhost:6333](http://localhost:6333/).
 
 
 ### Local development
-#### Linux/Debian
+#### Linux/Debian/MacOS
 To run Qdrant on local development environment you need to install below:
 - Install Rust, follow: [install rust](https://www.rust-lang.org/tools/install)
-- Install `rustfmt` toolchain for Rust 
+- Install `rustfmt` toolchain for Rust
     ```shell
     rustup component add rustfmt
     ```
 - Install dependencies:
     ```shell
-    sudo apt-get update -y 
+    sudo apt-get update -y
     sudo apt-get upgrade -y
     sudo apt-get install -y curl unzip gcc-multilib \
         clang cmake jq \
@@ -60,17 +62,18 @@ To run Qdrant on local development environment you need to install below:
 - Install `protoc` from source
     ```shell
     PROTOC_VERSION=22.2
+    PKG_NAME=$(uname -s | awk '{print ($1 == "Darwin") ? "osx-universal_binary" : (($1 == "Linux") ? "linux-x86_64" : "")}')
 
-    # curl `proto` source file 
-    curl -LO https://github.com/protocolbuffers/protobuf/releases//download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-linux-x86_64.zip
+    # curl `proto` source file
+    curl -LO https://github.com/protocolbuffers/protobuf/releases//download/v$PROTOC_VERSION/protoc-$PROTOC_VERSION-$PKG_NAME.zip
 
-    unzip protoc-$PROTOC_VERSION-linux-x86_64.zip -d $HOME/.local
+    unzip protoc-$PROTOC_VERSION-$PKG_NAME.zip -d $HOME/.local
 
     export PATH="$PATH:$HOME/.local/bin"
 
     # remove source file if not needed
-    rm protoc-$PROTOC_VERSION-linux-x86_64.zip
-    
+    rm protoc-$PROTOC_VERSION-$PKG_NAME.zip
+
     # check installed `protoc` version
     protoc --version
     ```
@@ -80,6 +83,21 @@ To run Qdrant on local development environment you need to install below:
 
     ./target/release/qdrant
     ```
+- Install Python dependencies for testing
+    ```shell
+    poetry -C tests install --sync
+    ```
+    Then you could use `poetry -C run pytest tests/openapi` and `poetry -C run pytest tests/consensus_tests` to run the tests.
+- Use the web UI
+
+    Web UI repo is [in a separate repo](https://github.com/qdrant/qdrant-web-ui), but there's a utility script to sync it to the `static` folder:
+    ```shell
+    ./tools/sync-web-ui.sh
+    ```
+
+### Nix/NixOS
+If you are using [Nix package manager](https://nixos.org/) (available for Linux and MacOS), you can run `nix-shell` in the project root to get a shell with all dependencies installed.
+It includes dependencies to build Rust code as well as to run Python tests and various tools in the `./tools` directory.
 
 ## Profiling
 
@@ -97,7 +115,7 @@ In this case you will see the execution timings and, if you launched this bench 
 Example output:
 
 ```
-scoring-vector/basic-score-point                                                                            
+scoring-vector/basic-score-point
                         time:   [111.81 us 112.07 us 112.31 us]
                         change: [+19.567% +20.454% +21.404%] (p = 0.00 < 0.05)
                         Performance has regressed.
@@ -106,7 +124,7 @@ Found 9 outliers among 100 measurements (9.00%)
   3 (3.00%) low mild
   2 (2.00%) high mild
   1 (1.00%) high severe
-scoring-vector/basic-score-point-10x                                                                            
+scoring-vector/basic-score-point-10x
                         time:   [111.86 us 112.44 us 113.04 us]
                         change: [-1.6120% -0.5554% +0.5103%] (p = 0.32 > 0.05)
                         No change in performance detected.
@@ -134,6 +152,37 @@ Use [pprof](https://github.com/google/pprof) and the following command to genera
 ```
 
 ![call-graph example](./imgs/call-graph-profile.png)
+
+### Tango.rs-based benchmarks
+
+Some benchmarks are implemented using the [Tango.rs](https://github.com/bazhenov/tango) framework.
+It enables more precise comparisons between two revisions of the code by running them simultaneously.
+Basic usage:
+
+1. Compile and run the baseline version in the `solo` mode:
+   ```console
+   $ cargo bench -p common --bench bitpacking_tango -- solo
+       Finished `bench` profile [optimized + debuginfo] target(s) in 0.22s
+        Running benches/bitpacking_tango.rs (target/release/deps/bitpacking_tango-9713980dd08cde85)
+   bitpacking/read                                     [  30.8 ns ...  43.9 ns ... 125.3 ns ]  stddev:   6.7 ns
+   bitpacking/write                                    [  32.4 ns ...  50.1 ns ...  91.1 ns ]  stddev:   7.3 ns
+   bitpacking_links/read                               [ 343.3 ns ... 378.3 ns ... 419.4 ns ]  stddev:  16.5 ns
+   ```
+
+2. Note the binary name in the output above. Copy it to compare against, or use the `cargo-export` tool to automate this step.
+   ```console
+   $ cp target/release/deps/bitpacking_tango-9713980dd08cde85 ./baseline
+   ```
+
+3. Change the code and run the benchmark in the `compare` mode to compare the performance against the baseline.
+   ```console
+   $ cargo bench -p common --bench bitpacking_tango -- compare ./baseline
+       Finished `bench` profile [optimized + debuginfo] target(s) in 0.14s
+        Running benches/bitpacking_tango.rs (target/release/deps/bitpacking_tango-9713980dd08cde85)
+   bitpacking/read                                    [  41.8 ns ...  41.9 ns ]      +0.08%
+   bitpacking/write                                   [  45.7 ns ...  45.5 ns ]      -0.46%
+   bitpacking_links/read                              [ 369.4 ns ... 368.4 ns ]      -0.27%
+   ```
 
 ### Real-time profiling
 
@@ -200,8 +249,8 @@ Here is a quick step-by-step guide:
 1. code endpoints and model in Rust
 2. change specs in `/openapi/*ytt.yaml`
 3. add new schema definitions to `src/schema_generator.rs`
-4. run `/tools/generate_openapi_models.sh` to generate specs
-5. update integration tests `openapi/tests/openapi_integration` and run them with `./tests/openapi_integration_test.sh`
+4. run `./tools/generate_openapi_models.sh` to generate specs
+5. update integration tests `tests/openapi` and run them with `pytest tests/openapi` (use poetry or nix to get `pytest`)
 6. expose file by starting an HTTP server, for instance `python -m http.server`, in `/docs/redoc`
 7. validate specs by browsing redoc on `http://localhost:8000/?v=master`
 8. validate `openapi-merged.yaml` using [swagger editor](https://editor.swagger.io/)
@@ -221,3 +270,9 @@ Our protocol buffers are defined in `lib/api/src/grpc/proto/*.proto`
 7. generate docs `./tools/generate_grpc_docs.sh`
 
 Here is a good [tonic tutorial](https://github.com/hyperium/tonic/blob/master/examples/routeguide-tutorial.md#defining-the-service) for reference.
+
+### System integration
+
+On top of the API definitions, Qdrant has a few system integrations that need to be considered when making changes:
+1. add new endpoints to the metrics allow lists in `src/common/metrics.rs`
+2. test the JWT integration in `tests/auth_tests`

@@ -1,43 +1,81 @@
+use api::rest::models::HardwareUsage;
 use prometheus::proto::{Counter, Gauge, LabelPair, Metric, MetricFamily, MetricType};
 use prometheus::TextEncoder;
+use segment::common::operation_time_statistics::OperationDurationStatistics;
 
+use super::telemetry_ops::hardware::HardwareTelemetry;
 use crate::common::telemetry::TelemetryData;
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppFeaturesTelemetry};
 use crate::common::telemetry_ops::cluster_telemetry::{ClusterStatusTelemetry, ClusterTelemetry};
 use crate::common::telemetry_ops::collections_telemetry::{
     CollectionTelemetryEnum, CollectionsTelemetry,
 };
+use crate::common::telemetry_ops::memory_telemetry::MemoryTelemetry;
 use crate::common::telemetry_ops::requests_telemetry::{
     GrpcTelemetry, RequestsTelemetry, WebApiTelemetry,
 };
 
 /// Whitelist for REST endpoints in metrics output.
 ///
-/// Contains selection of search, recommend and upsert endpoints.
+/// Contains selection of search, recommend, scroll and upsert endpoints.
 ///
 /// This array *must* be sorted.
 const REST_ENDPOINT_WHITELIST: &[&str] = &[
     "/collections/{name}/index",
     "/collections/{name}/points",
+    "/collections/{name}/points/batch",
+    "/collections/{name}/points/count",
+    "/collections/{name}/points/delete",
+    "/collections/{name}/points/discover",
+    "/collections/{name}/points/discover/batch",
+    "/collections/{name}/points/facet",
     "/collections/{name}/points/payload",
+    "/collections/{name}/points/payload/clear",
+    "/collections/{name}/points/payload/delete",
+    "/collections/{name}/points/query",
+    "/collections/{name}/points/query/batch",
+    "/collections/{name}/points/query/groups",
     "/collections/{name}/points/recommend",
     "/collections/{name}/points/recommend/batch",
+    "/collections/{name}/points/recommend/groups",
+    "/collections/{name}/points/scroll",
     "/collections/{name}/points/search",
     "/collections/{name}/points/search/batch",
+    "/collections/{name}/points/search/groups",
+    "/collections/{name}/points/search/matrix/offsets",
+    "/collections/{name}/points/search/matrix/pairs",
+    "/collections/{name}/points/vectors",
+    "/collections/{name}/points/vectors/delete",
 ];
 
 /// Whitelist for GRPC endpoints in metrics output.
 ///
-/// Contains selection of search, recommend and upsert endpoints.
+/// Contains selection of search, recommend, scroll and upsert endpoints.
 ///
 /// This array *must* be sorted.
 const GRPC_ENDPOINT_WHITELIST: &[&str] = &[
+    "/qdrant.Points/ClearPayload",
+    "/qdrant.Points/Count",
+    "/qdrant.Points/Delete",
+    "/qdrant.Points/DeletePayload",
+    "/qdrant.Points/Discover",
+    "/qdrant.Points/DiscoverBatch",
+    "/qdrant.Points/Facet",
+    "/qdrant.Points/Get",
     "/qdrant.Points/OverwritePayload",
+    "/qdrant.Points/Query",
+    "/qdrant.Points/QueryBatch",
+    "/qdrant.Points/QueryGroups",
     "/qdrant.Points/Recommend",
     "/qdrant.Points/RecommendBatch",
+    "/qdrant.Points/RecommendGroups",
+    "/qdrant.Points/Scroll",
     "/qdrant.Points/Search",
     "/qdrant.Points/SearchBatch",
+    "/qdrant.Points/SearchGroups",
     "/qdrant.Points/SetPayload",
+    "/qdrant.Points/UpdateBatch",
+    "/qdrant.Points/UpdateVectors",
     "/qdrant.Points/Upsert",
 ];
 
@@ -72,8 +110,18 @@ impl MetricsProvider for TelemetryData {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
         self.app.add_metrics(metrics);
         self.collections.add_metrics(metrics);
-        self.cluster.add_metrics(metrics);
-        self.requests.add_metrics(metrics);
+        if let Some(cluster) = &self.cluster {
+            cluster.add_metrics(metrics);
+        }
+        if let Some(requests) = &self.requests {
+            requests.add_metrics(metrics);
+        }
+        if let Some(hardware) = &self.hardware {
+            hardware.add_metrics(metrics);
+        }
+        if let Some(mem) = &self.memory {
+            mem.add_metrics(metrics);
+        }
     }
 }
 
@@ -82,8 +130,8 @@ impl MetricsProvider for AppBuildTelemetry {
         metrics.push(metric_family(
             "app_info",
             "information about qdrant server",
-            MetricType::COUNTER,
-            vec![counter(
+            MetricType::GAUGE,
+            vec![gauge(
                 1.0,
                 &[("name", &self.name), ("version", &self.version)],
             )],
@@ -97,8 +145,8 @@ impl MetricsProvider for AppFeaturesTelemetry {
         metrics.push(metric_family(
             "app_status_recovery_mode",
             "features enabled in qdrant server",
-            MetricType::COUNTER,
-            vec![counter(if self.recovery_mode { 1.0 } else { 0.0 }, &[])],
+            MetricType::GAUGE,
+            vec![gauge(if self.recovery_mode { 1.0 } else { 0.0 }, &[])],
         ))
     }
 }
@@ -131,14 +179,22 @@ impl MetricsProvider for CollectionsTelemetry {
 
 impl MetricsProvider for ClusterTelemetry {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        let ClusterTelemetry {
+            enabled,
+            status,
+            config: _,
+            peers: _,
+            metadata: _,
+        } = self;
+
         metrics.push(metric_family(
             "cluster_enabled",
             "is cluster support enabled",
-            MetricType::COUNTER,
-            vec![counter(if self.enabled { 1.0 } else { 0.0 }, &[])],
+            MetricType::GAUGE,
+            vec![gauge(if *enabled { 1.0 } else { 0.0 }, &[])],
         ));
 
-        if let Some(ref status) = self.status {
+        if let Some(ref status) = status {
             status.add_metrics(metrics);
         }
     }
@@ -191,89 +247,34 @@ impl MetricsProvider for RequestsTelemetry {
 
 impl MetricsProvider for WebApiTelemetry {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
-        let (mut total, mut fail_total, mut avg_secs, mut min_secs, mut max_secs) =
-            (vec![], vec![], vec![], vec![], vec![]);
+        let mut builder = OperationDurationMetricsBuilder::default();
         for (endpoint, responses) in &self.responses {
-            let (method, endpoint) = endpoint.split_once(' ').unwrap();
-
+            let Some((method, endpoint)) = endpoint.split_once(' ') else {
+                continue;
+            };
             // Endpoint must be whitelisted
             if REST_ENDPOINT_WHITELIST.binary_search(&endpoint).is_err() {
                 continue;
             }
-
             for (status, stats) in responses {
-                let labels = [
-                    ("method", method),
-                    ("endpoint", endpoint),
-                    ("status", &status.to_string()),
-                ];
-                total.push(counter(stats.count as f64, &labels));
-                fail_total.push(counter(stats.fail_count as f64, &labels));
-
-                if *status == REST_TIMINGS_FOR_STATUS {
-                    avg_secs.push(gauge(
-                        stats.avg_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                        &labels,
-                    ));
-                    min_secs.push(gauge(
-                        stats.min_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                        &labels,
-                    ));
-                    max_secs.push(gauge(
-                        stats.max_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                        &labels,
-                    ));
-                }
+                builder.add(
+                    stats,
+                    &[
+                        ("method", method),
+                        ("endpoint", endpoint),
+                        ("status", &status.to_string()),
+                    ],
+                    *status == REST_TIMINGS_FOR_STATUS,
+                );
             }
         }
-
-        if !total.is_empty() {
-            metrics.push(metric_family(
-                "rest_responses_total",
-                "total number of responses",
-                MetricType::COUNTER,
-                total,
-            ));
-        }
-        if !fail_total.is_empty() {
-            metrics.push(metric_family(
-                "rest_responses_fail_total",
-                "total number of failed responses",
-                MetricType::COUNTER,
-                fail_total,
-            ));
-        }
-        if !avg_secs.is_empty() {
-            metrics.push(metric_family(
-                "rest_responses_avg_duration_seconds",
-                "average response duration",
-                MetricType::GAUGE,
-                avg_secs,
-            ));
-        }
-        if !min_secs.is_empty() {
-            metrics.push(metric_family(
-                "rest_responses_min_duration_seconds",
-                "minimum response duration",
-                MetricType::GAUGE,
-                min_secs,
-            ));
-        }
-        if !max_secs.is_empty() {
-            metrics.push(metric_family(
-                "rest_responses_max_duration_seconds",
-                "maximum response duration",
-                MetricType::GAUGE,
-                max_secs,
-            ));
-        }
+        builder.build("rest", metrics);
     }
 }
 
 impl MetricsProvider for GrpcTelemetry {
     fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
-        let (mut total, mut fail_total, mut avg_secs, mut min_secs, mut max_secs) =
-            (vec![], vec![], vec![], vec![], vec![]);
+        let mut builder = OperationDurationMetricsBuilder::default();
         for (endpoint, stats) in &self.responses {
             // Endpoint must be whitelisted
             if GRPC_ENDPOINT_WHITELIST
@@ -282,62 +283,163 @@ impl MetricsProvider for GrpcTelemetry {
             {
                 continue;
             }
+            builder.add(stats, &[("endpoint", endpoint.as_str())], true);
+        }
+        builder.build("grpc", metrics);
+    }
+}
 
-            let labels = [("endpoint", endpoint.as_str())];
-            total.push(counter(stats.count as f64, &labels));
-            fail_total.push(counter(stats.fail_count as f64, &labels));
-            avg_secs.push(gauge(
-                stats.avg_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                &labels,
-            ));
-            min_secs.push(gauge(
-                stats.min_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                &labels,
-            ));
-            max_secs.push(gauge(
-                stats.max_duration_micros.unwrap_or(0.0) as f64 / 1_000_000.0,
-                &labels,
+impl MetricsProvider for MemoryTelemetry {
+    fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        metrics.push(metric_family(
+            "memory_active_bytes",
+            "Total number of bytes in active pages allocated by the application",
+            MetricType::GAUGE,
+            vec![gauge(self.active_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_allocated_bytes",
+            "Total number of bytes allocated by the application",
+            MetricType::GAUGE,
+            vec![gauge(self.allocated_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_metadata_bytes",
+            "Total number of bytes dedicated to metadata",
+            MetricType::GAUGE,
+            vec![gauge(self.metadata_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_resident_bytes",
+            "Maximum number of bytes in physically resident data pages mapped",
+            MetricType::GAUGE,
+            vec![gauge(self.resident_bytes as f64, &[])],
+        ));
+        metrics.push(metric_family(
+            "memory_retained_bytes",
+            "Total number of bytes in virtual memory mappings",
+            MetricType::GAUGE,
+            vec![gauge(self.retained_bytes as f64, &[])],
+        ));
+    }
+}
+
+impl MetricsProvider for HardwareTelemetry {
+    fn add_metrics(&self, metrics: &mut Vec<MetricFamily>) {
+        for (collection, hw_info) in self.collection_data.iter() {
+            let HardwareUsage { cpu } = hw_info;
+
+            metrics.push(metric_family(
+                "collection_hardware_metric_cpu",
+                "CPU measurements of a collection",
+                MetricType::GAUGE,
+                vec![gauge(*cpu as f64, &[("id", collection)])],
             ));
         }
+    }
+}
 
-        if !total.is_empty() {
+/// A helper struct to build a vector of [`MetricFamily`] out of a collection of
+/// [`OperationDurationStatistics`].
+#[derive(Default)]
+struct OperationDurationMetricsBuilder {
+    total: Vec<Metric>,
+    fail_total: Vec<Metric>,
+    avg_secs: Vec<Metric>,
+    min_secs: Vec<Metric>,
+    max_secs: Vec<Metric>,
+    duration_histogram_secs: Vec<Metric>,
+}
+
+impl OperationDurationMetricsBuilder {
+    /// Add metrics for the provided statistics.
+    /// If `add_timings` is `false`, only the total and fail_total counters will be added.
+    pub fn add(
+        &mut self,
+        stat: &OperationDurationStatistics,
+        labels: &[(&str, &str)],
+        add_timings: bool,
+    ) {
+        self.total.push(counter(stat.count as f64, labels));
+        self.fail_total
+            .push(counter(stat.fail_count as f64, labels));
+
+        if !add_timings {
+            return;
+        }
+
+        self.avg_secs.push(gauge(
+            f64::from(stat.avg_duration_micros.unwrap_or(0.0)) / 1_000_000.0,
+            labels,
+        ));
+        self.min_secs.push(gauge(
+            f64::from(stat.min_duration_micros.unwrap_or(0.0)) / 1_000_000.0,
+            labels,
+        ));
+        self.max_secs.push(gauge(
+            f64::from(stat.max_duration_micros.unwrap_or(0.0)) / 1_000_000.0,
+            labels,
+        ));
+        self.duration_histogram_secs.push(histogram(
+            stat.count as u64,
+            stat.total_duration_micros as f64 / 1_000_000.0,
+            &stat
+                .duration_micros_histogram
+                .iter()
+                .map(|&(b, c)| (f64::from(b) / 1_000_000.0, c as u64))
+                .collect::<Vec<_>>(),
+            labels,
+        ));
+    }
+
+    /// Build metrics and add them to the provided vector.
+    pub fn build(self, prefix: &str, metrics: &mut Vec<MetricFamily>) {
+        if !self.total.is_empty() {
             metrics.push(metric_family(
-                "grpc_responses_total",
+                &format!("{prefix}_responses_total"),
                 "total number of responses",
                 MetricType::COUNTER,
-                total,
+                self.total,
             ));
         }
-        if !fail_total.is_empty() {
+        if !self.fail_total.is_empty() {
             metrics.push(metric_family(
-                "grpc_responses_fail_total",
+                &format!("{prefix}_responses_fail_total"),
                 "total number of failed responses",
                 MetricType::COUNTER,
-                fail_total,
+                self.fail_total,
             ));
         }
-        if !avg_secs.is_empty() {
+        if !self.avg_secs.is_empty() {
             metrics.push(metric_family(
-                "grpc_responses_avg_duration_seconds",
+                &format!("{prefix}_responses_avg_duration_seconds"),
                 "average response duration",
                 MetricType::GAUGE,
-                avg_secs,
+                self.avg_secs,
             ));
         }
-        if !min_secs.is_empty() {
+        if !self.min_secs.is_empty() {
             metrics.push(metric_family(
-                "grpc_responses_min_duration_seconds",
+                &format!("{prefix}_responses_min_duration_seconds"),
                 "minimum response duration",
                 MetricType::GAUGE,
-                min_secs,
+                self.min_secs,
             ));
         }
-        if !max_secs.is_empty() {
+        if !self.max_secs.is_empty() {
             metrics.push(metric_family(
-                "grpc_responses_max_duration_seconds",
+                &format!("{prefix}_responses_max_duration_seconds"),
                 "maximum response duration",
                 MetricType::GAUGE,
-                max_secs,
+                self.max_secs,
+            ));
+        }
+        if !self.duration_histogram_secs.is_empty() {
+            metrics.push(metric_family(
+                &format!("{prefix}_responses_duration_seconds"),
+                "response duration histogram",
+                MetricType::HISTOGRAM,
+                self.duration_histogram_secs,
             ));
         }
     }
@@ -370,6 +472,34 @@ fn gauge(value: f64, labels: &[(&str, &str)]) -> Metric {
         let mut gauge = Gauge::default();
         gauge.set_value(value);
         gauge
+    });
+    metric
+}
+
+fn histogram(
+    sample_count: u64,
+    sample_sum: f64,
+    buckets: &[(f64, u64)],
+    labels: &[(&str, &str)],
+) -> Metric {
+    let mut metric = Metric::default();
+    metric.set_label(labels.iter().map(|(n, v)| label_pair(n, v)).collect());
+    metric.set_histogram({
+        let mut histogram = prometheus::proto::Histogram::default();
+        histogram.set_sample_count(sample_count);
+        histogram.set_sample_sum(sample_sum);
+        histogram.set_bucket(
+            buckets
+                .iter()
+                .map(|&(upper_bound, cumulative_count)| {
+                    let mut bucket = prometheus::proto::Bucket::default();
+                    bucket.set_cumulative_count(cumulative_count);
+                    bucket.set_upper_bound(upper_bound);
+                    bucket
+                })
+                .collect(),
+        );
+        histogram
     });
     metric
 }

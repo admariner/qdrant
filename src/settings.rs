@@ -5,14 +5,18 @@ use api::grpc::transport_channel_pool::{
 };
 use collection::operations::validation;
 use config::{Config, ConfigError, Environment, File, FileFormat, Source};
-use segment::common::cpu::get_num_cpus;
 use serde::Deserialize;
 use storage::types::StorageConfig;
 use validator::Validate;
 
+use crate::common::debugger::DebuggerConfig;
+use crate::common::inference::config::InferenceConfig;
+use crate::tracing;
+
 const DEFAULT_CONFIG: &str = include_str!("../config/config.yaml");
 
 #[derive(Debug, Deserialize, Validate, Clone)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct ServiceConfig {
     #[validate(length(min = 1))]
     pub host: String,
@@ -27,6 +31,13 @@ pub struct ServiceConfig {
     #[serde(default)]
     pub verify_https_client_certificate: bool,
     pub api_key: Option<String>,
+    pub read_only_api_key: Option<String>,
+    #[serde(default)]
+    pub jwt_rbac: Option<bool>,
+
+    #[serde(default)]
+    pub hide_jwt_dashboard: Option<bool>,
+
     /// Directory where static files are served from.
     /// For example, the Web-UI should be placed here.
     #[serde(default)]
@@ -36,6 +47,19 @@ pub struct ServiceConfig {
     /// This includes the Web-UI. True by default.
     #[serde(default)]
     pub enable_static_content: Option<bool>,
+
+    /// How much time is considered too long for a query to execute.
+    pub slow_query_secs: Option<f32>,
+
+    /// Whether to enable reporting of measured hardware utilization in API responses.
+    #[serde(default)]
+    pub hardware_reporting: Option<bool>,
+}
+
+impl ServiceConfig {
+    pub fn hardware_reporting(&self) -> bool {
+        self.hardware_reporting.unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Default, Validate)]
@@ -48,14 +72,15 @@ pub struct ClusterConfig {
     #[validate(range(min = 1))]
     pub connection_timeout_ms: u64,
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub p2p: P2pConfig,
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub consensus: ConsensusConfig,
 }
 
 #[derive(Debug, Deserialize, Clone, Validate)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct P2pConfig {
     #[serde(default)]
     pub port: Option<u16>,
@@ -89,6 +114,9 @@ pub struct ConsensusConfig {
     #[validate(range(min = 1))]
     #[serde(default = "default_message_timeout_tics")]
     pub message_timeout_ticks: u64,
+    #[allow(dead_code)] // `schema_generator` complains about this 🙄
+    #[serde(default)]
+    pub compact_wal_entries: u64, // compact WAL when it grows to enough applied entries
 }
 
 impl Default for ConsensusConfig {
@@ -98,6 +126,7 @@ impl Default for ConsensusConfig {
             tick_period_ms: default_tick_period_ms(),
             bootstrap_timeout_sec: default_bootstrap_timeout_sec(),
             message_timeout_ticks: default_message_timeout_tics(),
+            compact_wal_entries: 0,
         }
     }
 }
@@ -112,112 +141,81 @@ pub struct TlsConfig {
     pub cert_ttl: Option<u64>,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Deserialize, Validate)]
+pub struct GpuConfig {
+    /// Enable GPU indexing.
+    #[serde(default)]
+    pub indexing: bool,
+    /// Force half precision for `f32` values while indexing.
+    /// `f16` conversion will take place only inside GPU memory and won't affect storage type.
+    #[serde(default)]
+    pub force_half_precision: bool,
+    /// Used vulkan "groups" of GPU. In other words, how many parallel points can be indexed by GPU.
+    /// Optimal value might depend on the GPU model.
+    /// Proportional, but doesn't necessary equal to the physical number of warps.
+    /// Do not change this value unless you know what you are doing.
+    /// Default: 512
+    #[serde(default)]
+    #[validate(range(min = 1))]
+    pub groups_count: Option<usize>,
+    /// Filter for GPU devices by hardware name. Case insensitive.
+    /// Comma-separated list of substrings to match against the gpu device name.
+    /// Example: "nvidia"
+    /// Default: "" - all devices are accepted.
+    #[serde(default)]
+    pub device_filter: String,
+    /// List of explicit GPU devices to use.
+    /// If host has multiple GPUs, this option allows to select specific devices
+    /// by their index in the list of found devices.
+    /// If `device_filter` is set, indexes are applied after filtering.
+    /// By default, all devices are accepted.
+    #[serde(default)]
+    pub devices: Option<Vec<usize>>,
+    /// How many parallel indexing processes are allowed to run.
+    /// Default: 1
+    #[serde(default)]
+    pub parallel_indexes: Option<usize>,
+    /// Allow to use integrated GPUs.
+    /// Default: false
+    #[serde(default)]
+    pub allow_integrated: bool,
+    /// Allow to use emulated GPUs like LLVMpipe. Useful for CI.
+    /// Default: false
+    #[serde(default)]
+    pub allow_emulated: bool,
+}
+
 #[derive(Debug, Deserialize, Clone, Validate)]
+#[allow(dead_code)] // necessary because some field are only used in main.rs
 pub struct Settings {
-    #[serde(default = "default_log_level")]
-    pub log_level: String,
-    #[validate]
+    #[serde(default)]
+    pub log_level: Option<String>,
+    #[serde(default)]
+    pub logger: tracing::LoggerConfig,
+    #[validate(nested)]
     pub storage: StorageConfig,
-    #[validate]
+    #[validate(nested)]
     pub service: ServiceConfig,
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub cluster: ClusterConfig,
     #[serde(default = "default_telemetry_disabled")]
     pub telemetry_disabled: bool,
-    #[validate]
+    #[validate(nested)]
     pub tls: Option<TlsConfig>,
+    #[serde(default)]
+    pub debugger: DebuggerConfig,
     /// A list of messages for errors that happened during loading the configuration. We collect
     /// them and store them here while loading because then our logger is not configured yet.
     /// We therefore need to log these messages later, after the logger is ready.
     #[serde(default, skip)]
     pub load_errors: Vec<LogMsg>,
-}
-
-#[derive(Clone, Debug)]
-pub enum LogMsg {
-    Warn(String),
-    Error(String),
-}
-
-impl LogMsg {
-    fn log(&self) {
-        match self {
-            Self::Warn(msg) => log::warn!("{msg}"),
-            Self::Error(msg) => log::error!("{msg}"),
-        }
-    }
-}
-
-impl Settings {
-    pub fn tls(&self) -> io::Result<&TlsConfig> {
-        self.tls
-            .as_ref()
-            .ok_or_else(Self::tls_config_is_undefined_error)
-    }
-
-    pub fn tls_config_is_undefined_error() -> io::Error {
-        io::Error::new(
-            io::ErrorKind::Other,
-            "TLS config is not defined in the Qdrant config file",
-        )
-    }
-
-    #[allow(dead_code)]
-    pub fn validate_and_warn(&self) {
-        // Print any load error messages we had
-        self.load_errors.iter().for_each(LogMsg::log);
-
-        if let Err(ref errs) = self.validate() {
-            validation::warn_validation_errors("Settings configuration file", errs);
-        }
-    }
-}
-
-const fn default_telemetry_disabled() -> bool {
-    false
-}
-
-const fn default_cors() -> bool {
-    true
-}
-
-fn default_log_level() -> String {
-    "INFO".to_string()
-}
-
-const fn default_timeout_ms() -> u64 {
-    DEFAULT_GRPC_TIMEOUT.as_millis() as u64
-}
-
-const fn default_connection_timeout_ms() -> u64 {
-    DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
-}
-
-const fn default_tick_period_ms() -> u64 {
-    100
-}
-
-// Should not be less than `DEFAULT_META_OP_WAIT` as bootstrapping perform sync. consensus meta operations.
-const fn default_bootstrap_timeout_sec() -> u64 {
-    15
-}
-
-const fn default_max_message_queue_size() -> usize {
-    100
-}
-
-const fn default_connection_pool_size() -> usize {
-    DEFAULT_POOL_SIZE
-}
-
-const fn default_message_timeout_tics() -> u64 {
-    10
-}
-
-const fn default_tls_cert_ttl() -> Option<u64> {
-    // Default one hour
-    Some(3600)
+    #[serde(default)]
+    pub inference: Option<InferenceConfig>,
+    #[serde(default)]
+    #[validate(nested)]
+    pub gpu: Option<GpuConfig>,
 }
 
 impl Settings {
@@ -259,6 +257,12 @@ impl Settings {
             // Merge local config, not tracked in git: config/local
             .add_source(File::with_name("config/local").required(false));
 
+        #[cfg(feature = "deb")]
+        {
+            // Read config, installed with deb package
+            config = config.add_source(File::with_name("/etc/qdrant/config").required(false));
+        }
+
         // Merge user provided config with --config-path
         if let Some(path) = custom_config_path {
             config = config.add_source(File::with_name(&path).required(false));
@@ -273,21 +277,120 @@ impl Settings {
         settings.load_errors.extend(load_errors);
         Ok(settings)
     }
+
+    pub fn tls(&self) -> io::Result<&TlsConfig> {
+        self.tls
+            .as_ref()
+            .ok_or_else(Self::tls_config_is_undefined_error)
+    }
+
+    pub fn tls_config_is_undefined_error() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Other,
+            "TLS config is not defined in the Qdrant config file",
+        )
+    }
+
+    #[allow(dead_code)]
+    pub fn validate_and_warn(&self) {
+        //
+        // JWT RBAC
+        //
+        // Using HMAC-SHA256, recommended secret size is 32 bytes
+        const JWT_RECOMMENDED_SECRET_LENGTH: usize = 256 / 8;
+
+        // Log if JWT RBAC is enabled but no API key is set
+        if self.service.jwt_rbac.unwrap_or_default() {
+            if self.service.api_key.clone().unwrap_or_default().is_empty() {
+                log::warn!("JWT RBAC configured but no API key set, JWT RBAC is not enabled")
+            // Log if JWT RAC is enabled, API key is set but smaller than recommended size for JWT secret
+            } else if self.service.api_key.clone().unwrap_or_default().len()
+                < JWT_RECOMMENDED_SECRET_LENGTH
+            {
+                log::warn!(
+                "It is highly recommended to use an API key of {} bytes when JWT RBAC is enabled",
+                JWT_RECOMMENDED_SECRET_LENGTH
+            )
+            }
+        }
+
+        // Print any load error messages we had
+        self.load_errors.iter().for_each(LogMsg::log);
+
+        if let Err(ref errs) = self.validate() {
+            validation::warn_validation_errors("Settings configuration file", errs);
+        }
+    }
 }
 
 /// Returns the number of maximum actix workers.
-#[allow(dead_code)]
 pub fn max_web_workers(settings: &Settings) -> usize {
-    let max_workers = settings.service.max_workers;
-
-    if max_workers == Some(0) {
-        let num_cpu = get_num_cpus();
-        std::cmp::max(1, num_cpu - 1)
-    } else if max_workers.is_none() {
-        settings.storage.performance.max_search_threads
-    } else {
-        max_workers.unwrap()
+    match settings.service.max_workers {
+        Some(0) => {
+            let num_cpu = common::cpu::get_num_cpus();
+            std::cmp::max(1, num_cpu - 1)
+        }
+        Some(max_workers) => max_workers,
+        None => settings.storage.performance.max_search_threads,
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum LogMsg {
+    Warn(String),
+    Error(String),
+}
+
+impl LogMsg {
+    fn log(&self) {
+        match self {
+            Self::Warn(msg) => log::warn!("{msg}"),
+            Self::Error(msg) => log::error!("{msg}"),
+        }
+    }
+}
+
+const fn default_telemetry_disabled() -> bool {
+    false
+}
+
+const fn default_cors() -> bool {
+    true
+}
+
+const fn default_timeout_ms() -> u64 {
+    DEFAULT_GRPC_TIMEOUT.as_millis() as u64
+}
+
+const fn default_connection_timeout_ms() -> u64 {
+    DEFAULT_CONNECT_TIMEOUT.as_millis() as u64
+}
+
+const fn default_tick_period_ms() -> u64 {
+    100
+}
+
+// Should not be less than `DEFAULT_META_OP_WAIT` as bootstrapping perform sync. consensus meta operations.
+const fn default_bootstrap_timeout_sec() -> u64 {
+    15
+}
+
+const fn default_max_message_queue_size() -> usize {
+    100
+}
+
+const fn default_connection_pool_size() -> usize {
+    DEFAULT_POOL_SIZE
+}
+
+const fn default_message_timeout_tics() -> u64 {
+    10
+}
+
+#[allow(clippy::unnecessary_wraps)] // Used as serde default
+const fn default_tls_cert_ttl() -> Option<u64> {
+    // Default one hour
+    Some(3600)
 }
 
 #[cfg(test)]

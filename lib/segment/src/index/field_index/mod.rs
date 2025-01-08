@@ -4,17 +4,20 @@ use common::types::PointOffsetType;
 
 use crate::types::{FieldCondition, IsEmptyCondition, IsNullCondition};
 
+pub mod bool_index;
+pub(super) mod facet_index;
 mod field_index_base;
 pub mod full_text_index;
 pub mod geo_hash;
 pub mod geo_index;
 mod histogram;
+mod immutable_point_to_values;
 pub mod index_selector;
 pub mod map_index;
+mod mmap_point_to_values;
 pub mod numeric_index;
 mod stat_tools;
 
-pub mod binary_index;
 #[cfg(test)]
 mod tests;
 mod utils;
@@ -22,12 +25,12 @@ mod utils;
 pub use field_index_base::*;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::large_enum_variant)]
 pub enum PrimaryCondition {
-    Condition(FieldCondition),
+    Condition(Box<FieldCondition>),
     IsEmpty(IsEmptyCondition),
     IsNull(IsNullCondition),
     Ids(HashSet<PointOffsetType>),
+    HasVector(String),
 }
 
 #[derive(Debug, Clone)]
@@ -49,7 +52,7 @@ pub struct CardinalityEstimation {
 }
 
 impl CardinalityEstimation {
-    pub fn exact(count: usize) -> Self {
+    pub const fn exact(count: usize) -> Self {
         CardinalityEstimation {
             primary_clauses: vec![],
             min: count,
@@ -59,7 +62,7 @@ impl CardinalityEstimation {
     }
 
     /// Generate estimation for unknown filter
-    pub fn unknown(total: usize) -> Self {
+    pub const fn unknown(total: usize) -> Self {
         CardinalityEstimation {
             primary_clauses: vec![],
             min: 0,
@@ -72,5 +75,10 @@ impl CardinalityEstimation {
     pub fn with_primary_clause(mut self, clause: PrimaryCondition) -> Self {
         self.primary_clauses.push(clause);
         self
+    }
+
+    #[cfg(test)]
+    pub const fn equals_min_exp_max(&self, other: &Self) -> bool {
+        self.min == other.min && self.exp == other.exp && self.max == other.max
     }
 }

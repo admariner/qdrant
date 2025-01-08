@@ -7,9 +7,11 @@ import "points_service.proto";
 import "points_internal_service.proto";
 import "qdrant_internal_service.proto";
 import "raft_service.proto";
+import "shard_snapshots_service.proto";
 import "snapshots_service.proto";
 
 package qdrant;
+option csharp_namespace = "Qdrant.Client.Grpc";
 
 service Qdrant {
   rpc HealthCheck (HealthCheckRequest) returns (HealthCheckReply) {}
@@ -20,4 +22,5 @@ message HealthCheckRequest {}
 message HealthCheckReply {
   string title = 1;
   string version = 2;
+  optional string commit = 3;
 }

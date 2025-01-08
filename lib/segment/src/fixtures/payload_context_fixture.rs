@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
@@ -25,6 +26,7 @@ use crate::types::{PayloadSchemaType, PointIdType, SeqNumberType};
 /// Warn: Use for tests only
 ///
 /// This struct mimics the interface of `PointsIterator` and `IdTracker` only for basic cases
+#[derive(Debug)]
 pub struct FixtureIdTracker {
     ids: Vec<PointOffsetType>,
     deleted: BitVec,
@@ -66,7 +68,7 @@ impl IdTracker for FixtureIdTracker {
 
     fn external_id(&self, internal_id: PointOffsetType) -> Option<PointIdType> {
         assert!(internal_id < self.ids.len() as PointOffsetType);
-        Some(PointIdType::NumId(internal_id as u64))
+        Some(PointIdType::NumId(u64::from(internal_id)))
     }
 
     fn set_link(
@@ -90,7 +92,7 @@ impl IdTracker for FixtureIdTracker {
             self.ids
                 .iter()
                 .copied()
-                .map(|id| PointIdType::NumId(id as u64)),
+                .map(|id| PointIdType::NumId(u64::from(id))),
         )
     }
 
@@ -115,8 +117,12 @@ impl IdTracker for FixtureIdTracker {
                 .iter()
                 .copied()
                 .skip_while(move |x| *x < start)
-                .map(|x| (PointIdType::NumId(x as u64), x)),
+                .map(|x| (PointIdType::NumId(u64::from(x)), x)),
         )
+    }
+
+    fn iter_random(&self) -> Box<dyn Iterator<Item = (PointIdType, PointOffsetType)> + '_> {
+        unimplemented!("Not used for tests yet")
     }
 
     fn total_point_count(&self) -> usize {
@@ -155,6 +161,18 @@ impl IdTracker for FixtureIdTracker {
     fn deleted_point_bitslice(&self) -> &BitSlice {
         &self.deleted
     }
+
+    fn cleanup_versions(&mut self) -> OperationResult<()> {
+        Ok(())
+    }
+
+    fn name(&self) -> &'static str {
+        "fixture id tracker"
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        vec![]
+    }
 }
 
 /// Creates in-memory payload storage and fills it with random points
@@ -174,7 +192,7 @@ pub fn create_payload_storage_fixture(num_points: usize, seed: u64) -> InMemoryP
     for id in 0..num_points {
         let payload = generate_diverse_payload(&mut rng);
         payload_storage
-            .assign(id as PointOffsetType, &payload)
+            .set(id as PointOffsetType, &payload)
             .unwrap();
     }
 
@@ -199,6 +217,7 @@ pub fn create_plain_payload_index(path: &Path, num_points: usize, seed: u64) -> 
     let condition_checker = Arc::new(SimpleConditionChecker::new(
         Arc::new(AtomicRefCell::new(payload_storage.into())),
         id_tracker.clone(),
+        HashMap::new(),
     ));
 
     PlainPayloadIndex::open(condition_checker, id_tracker, path).unwrap()
@@ -226,27 +245,32 @@ pub fn create_struct_payload_index(
     ));
     let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(num_points)));
 
-    let mut index = StructPayloadIndex::open(payload_storage, id_tracker, path, true).unwrap();
+    let mut index = StructPayloadIndex::open(
+        payload_storage,
+        id_tracker,
+        std::collections::HashMap::new(),
+        path,
+        true,
+    )
+    .unwrap();
 
     index
-        .set_indexed(STR_KEY, PayloadSchemaType::Keyword.into())
+        .set_indexed(&STR_KEY.parse().unwrap(), PayloadSchemaType::Keyword)
         .unwrap();
     index
-        .set_indexed(INT_KEY, PayloadSchemaType::Integer.into())
+        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed(FLT_KEY, PayloadSchemaType::Float.into())
+        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float)
         .unwrap();
     index
-        .set_indexed(GEO_KEY, PayloadSchemaType::Geo.into())
+        .set_indexed(&GEO_KEY.parse().unwrap(), PayloadSchemaType::Geo)
         .unwrap();
-
     index
-        .set_indexed(TEXT_KEY, PayloadSchemaType::Text.into())
+        .set_indexed(&TEXT_KEY.parse().unwrap(), PayloadSchemaType::Text)
         .unwrap();
-
     index
-        .set_indexed(BOOL_KEY, PayloadSchemaType::Bool.into())
+        .set_indexed(&BOOL_KEY.parse().unwrap(), PayloadSchemaType::Bool)
         .unwrap();
 
     index

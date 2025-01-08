@@ -6,11 +6,15 @@ use io::file_operations::FileStorageError;
 use tempfile::PersistError;
 use thiserror::Error;
 
+pub type StorageResult<T> = Result<T, StorageError>;
+
 #[derive(Error, Debug, Clone)]
 #[error("{0}")]
 pub enum StorageError {
     #[error("Wrong input: {description}")]
     BadInput { description: String },
+    #[error("Wrong input: {description}")]
+    AlreadyExists { description: String },
     #[error("Not found: {description}")]
     NotFound { description: String },
     #[error("Service internal error: {description}")]
@@ -24,9 +28,25 @@ pub enum StorageError {
     Locked { description: String },
     #[error("Timeout: {description}")]
     Timeout { description: String },
+    #[error("Checksum mismatch: expected {expected}, actual {actual}")]
+    ChecksumMismatch { expected: String, actual: String },
+    #[error("Forbidden: {description}")]
+    Forbidden { description: String },
+    #[error("Pre-condition failure: {description}")]
+    PreconditionFailed { description: String }, // system is not in the state to perform the operation
+    #[error("{description}")]
+    InferenceError { description: String },
+    #[error("Rate limiting exceeded: {description}")]
+    RateLimitExceeded { description: String },
 }
 
 impl StorageError {
+    pub fn inference_error(description: impl Into<String>) -> StorageError {
+        StorageError::InferenceError {
+            description: description.into(),
+        }
+    }
+
     pub fn service_error(description: impl Into<String>) -> StorageError {
         StorageError::ServiceError {
             description: description.into(),
@@ -42,6 +62,31 @@ impl StorageError {
 
     pub fn bad_input(description: impl Into<String>) -> StorageError {
         StorageError::BadInput {
+            description: description.into(),
+        }
+    }
+
+    pub fn already_exists(description: impl Into<String>) -> StorageError {
+        StorageError::AlreadyExists {
+            description: description.into(),
+        }
+    }
+
+    pub fn not_found(description: impl Into<String>) -> StorageError {
+        StorageError::NotFound {
+            description: description.into(),
+        }
+    }
+
+    pub fn checksum_mismatch(expected: impl Into<String>, actual: impl Into<String>) -> Self {
+        StorageError::ChecksumMismatch {
+            expected: expected.into(),
+            actual: actual.into(),
+        }
+    }
+
+    pub fn forbidden(description: impl Into<String>) -> StorageError {
+        StorageError::Forbidden {
             description: description.into(),
         }
     }
@@ -91,6 +136,20 @@ impl StorageError {
             CollectionError::Timeout { .. } => StorageError::Timeout {
                 description: overriding_description,
             },
+            CollectionError::PreConditionFailed { .. } => StorageError::PreconditionFailed {
+                description: overriding_description,
+            },
+            CollectionError::ObjectStoreError { .. } => StorageError::ServiceError {
+                description: overriding_description,
+                backtrace: None,
+            },
+            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded { description } => {
+                StorageError::RateLimitExceeded { description }
+            }
         }
     }
 }
@@ -132,6 +191,20 @@ impl From<CollectionError> for StorageError {
             CollectionError::Timeout { .. } => StorageError::Timeout {
                 description: format!("{err}"),
             },
+            CollectionError::PreConditionFailed { .. } => StorageError::PreconditionFailed {
+                description: format!("{err}"),
+            },
+            CollectionError::ObjectStoreError { .. } => StorageError::ServiceError {
+                description: format!("{err}"),
+                backtrace: None,
+            },
+            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded { description } => {
+                StorageError::RateLimitExceeded { description }
+            }
         }
     }
 }
@@ -145,6 +218,16 @@ impl From<IoError> for StorageError {
 impl From<FileStorageError> for StorageError {
     fn from(err: FileStorageError) -> Self {
         Self::service_error(err.to_string())
+    }
+}
+
+impl From<tempfile::PathPersistError> for StorageError {
+    fn from(err: tempfile::PathPersistError) -> Self {
+        Self::service_error(format!(
+            "failed to persist temporary file path {}: {}",
+            err.path.display(),
+            err.error,
+        ))
     }
 }
 
@@ -202,8 +285,8 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-impl From<prost::EncodeError> for StorageError {
-    fn from(err: prost::EncodeError) -> Self {
+impl From<prost_for_raft::EncodeError> for StorageError {
+    fn from(err: prost_for_raft::EncodeError) -> Self {
         StorageError::ServiceError {
             description: format!("prost encode error: {err}"),
             backtrace: Some(Backtrace::force_capture().to_string()),
@@ -211,8 +294,8 @@ impl From<prost::EncodeError> for StorageError {
     }
 }
 
-impl From<prost::DecodeError> for StorageError {
-    fn from(err: prost::DecodeError) -> Self {
+impl From<prost_for_raft::DecodeError> for StorageError {
+    fn from(err: prost_for_raft::DecodeError) -> Self {
         StorageError::ServiceError {
             description: format!("prost decode error: {err}"),
             backtrace: Some(Backtrace::force_capture().to_string()),
@@ -271,5 +354,11 @@ impl From<PersistError> for StorageError {
             description: format!("Persist error: {err}"),
             backtrace: Some(Backtrace::force_capture().to_string()),
         }
+    }
+}
+
+impl From<cancel::Error> for StorageError {
+    fn from(err: cancel::Error) -> Self {
+        CollectionError::from(err).into()
     }
 }

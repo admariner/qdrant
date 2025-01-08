@@ -1,6 +1,8 @@
 use std::sync::atomic::AtomicBool;
 
 use bitvec::slice::BitSlice;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::seq::IteratorRandom as _;
 use rand::SeedableRng as _;
@@ -11,10 +13,10 @@ use crate::data_types::vectors::QueryVector;
 use crate::fixtures::payload_context_fixture::FixtureIdTracker;
 use crate::id_tracker::IdTracker;
 use crate::types::Distance;
-use crate::vector_storage::memmap_vector_storage::open_memmap_vector_storage_with_async_io;
-use crate::vector_storage::simple_vector_storage::open_simple_vector_storage;
+use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
+use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
 use crate::vector_storage::vector_storage_base::VectorStorage;
-use crate::vector_storage::{async_raw_scorer, new_raw_scorer, VectorStorageEnum};
+use crate::vector_storage::{async_raw_scorer, new_raw_scorer_for_test, VectorStorageEnum};
 
 #[test]
 fn async_raw_scorer_cosine() -> Result<()> {
@@ -24,6 +26,11 @@ fn async_raw_scorer_cosine() -> Result<()> {
 #[test]
 fn async_raw_scorer_euclid() -> Result<()> {
     test_async_raw_scorer_defaults(Distance::Euclid)
+}
+
+#[test]
+fn async_raw_scorer_manhattan() -> Result<()> {
+    test_async_raw_scorer_defaults(Distance::Manhattan)
 }
 
 #[test]
@@ -49,8 +56,7 @@ fn test_async_raw_scorer(
         .prefix("immutable-storage")
         .tempdir()?;
 
-    let storage = open_memmap_vector_storage_with_async_io(dir.path(), dim, distance, true)?;
-    let mut storage = storage.borrow_mut();
+    let mut storage = open_memmap_vector_storage_with_async_io(dir.path(), dim, distance, true)?;
 
     let mut id_tracker = FixtureIdTracker::new(points);
 
@@ -61,46 +67,61 @@ fn test_async_raw_scorer(
 
         let db = rocksdb_wrapper::open_db(dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
 
-        let mutable_storage =
-            open_simple_vector_storage(db, rocksdb_wrapper::DB_VECTOR_CF, 4, distance)?;
+        let mut mutable_storage = open_simple_dense_vector_storage(
+            db,
+            rocksdb_wrapper::DB_VECTOR_CF,
+            dim,
+            distance,
+            &AtomicBool::new(false),
+        )?;
 
-        let mut mutable_storage = mutable_storage.borrow_mut();
+        insert_random_vectors(&mut rng, dim, &mut mutable_storage, points)?;
+        delete_random_vectors(&mut rng, &mut mutable_storage, &mut id_tracker, delete)?;
 
-        insert_random_vectors(&mut rng, &mut *mutable_storage, points)?;
-        delete_random_vectors(&mut rng, &mut *mutable_storage, &mut id_tracker, delete)?;
-
-        storage.update_from(&mutable_storage, &mut (0..points as _), &Default::default())?;
+        let mut iter = (0..points).map(|i| {
+            let i = i as PointOffsetType;
+            let vec = mutable_storage.get_vector(i);
+            let deleted = mutable_storage.is_deleted_vector(i);
+            (vec, deleted)
+        });
+        storage.update_from(&mut iter, &Default::default())?;
     }
 
     for _ in 0..score {
-        test_random_score(&mut rng, &storage, id_tracker.deleted_point_bitslice())?;
+        test_random_score(&mut rng, dim, &storage, id_tracker.deleted_point_bitslice())?;
     }
 
     Ok(())
 }
+
 fn insert_random_vectors(
     rng: &mut impl rand::Rng,
-    storage: &mut impl VectorStorage,
+    dim: usize,
+    storage: &mut VectorStorageEnum,
     vectors: usize,
 ) -> Result<()> {
-    insert_distributed_vectors(storage, vectors, &mut sampler(rng))
+    insert_distributed_vectors(dim, storage, vectors, &mut sampler(rng))
 }
 
 fn test_random_score(
     mut rng: impl rand::Rng,
+    dim: usize,
     storage: &VectorStorageEnum,
     deleted_points: &BitSlice,
 ) -> Result<()> {
-    let query: QueryVector = sampler(&mut rng)
-        .take(storage.vector_dim())
-        .collect_vec()
-        .into();
+    let query: QueryVector = sampler(&mut rng).take(dim).collect_vec().into();
 
-    let raw_scorer = new_raw_scorer(query.clone(), storage, deleted_points);
+    let raw_scorer = new_raw_scorer_for_test(query.clone(), storage, deleted_points).unwrap();
 
     let is_stopped = AtomicBool::new(false);
-    let async_raw_scorer = if let VectorStorageEnum::Memmap(storage) = storage {
-        async_raw_scorer::new(query, storage, deleted_points, &is_stopped)?
+    let async_raw_scorer = if let VectorStorageEnum::DenseMemmap(storage) = storage {
+        async_raw_scorer::new(
+            query,
+            storage,
+            deleted_points,
+            &is_stopped,
+            HardwareCounterCell::new(),
+        )?
     } else {
         unreachable!();
     };
@@ -112,6 +133,5 @@ fn test_random_score(
     let async_res = score(&*async_raw_scorer, &points);
 
     assert_eq!(res, async_res);
-
     Ok(())
 }

@@ -1,8 +1,12 @@
+use std::hash::Hash;
 use std::num::NonZeroU32;
 
+use api::rest::MaxOptimizationThreads;
 use merge::Merge;
 use schemars::JsonSchema;
-use segment::types::{BinaryQuantization, HnswConfig, ProductQuantization, ScalarQuantization};
+use segment::types::{
+    BinaryQuantization, HnswConfig, ProductQuantization, ScalarQuantization, StrictModeConfig,
+};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -71,7 +75,10 @@ pub struct HnswConfigDiff {
     )]
     #[validate(range(min = 10))]
     pub full_scan_threshold: Option<usize>,
-    /// Number of parallel threads used for background index building. If 0 - auto selection.
+    /// Number of parallel threads used for background index building.
+    /// If 0 - automatically select from 8 to 16.
+    /// Best to keep between 8 and 16 to prevent likelihood of building broken/inefficient HNSW graphs.
+    /// On small CPUs, less threads are used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_indexing_threads: Option<usize>,
     /// Store HNSW index on disk. If set to false, the index will be stored in RAM. Default: false
@@ -132,9 +139,10 @@ pub struct OptimizersConfigDiff {
     /// If search speed is more important - make this parameter higher.
     /// Note: 1Kb = 1 vector of size 256
     #[serde(alias = "max_segment_size_kb")]
+    #[validate(range(min = 1))]
     pub max_segment_size: Option<usize>,
     /// Maximum size (in kilobytes) of vectors to store in-memory per segment.
-    /// Segments larger than this threshold will be stored as read-only memmaped file.
+    /// Segments larger than this threshold will be stored as read-only memmapped file.
     ///
     /// Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
     ///
@@ -154,8 +162,11 @@ pub struct OptimizersConfigDiff {
     pub indexing_threshold: Option<usize>,
     /// Minimum interval between forced flushes.
     pub flush_interval_sec: Option<u64>,
-    /// Maximum available threads for optimization workers
-    pub max_optimization_threads: Option<usize>,
+    /// Max number of threads (jobs) for running optimizations per shard.
+    /// Note: each optimization job will also use `max_indexing_threads` threads by itself for index building.
+    /// If "auto" - have no limit and choose dynamically to saturate CPU.
+    /// If 0 - no optimization threads, optimizations will be disabled.
+    pub max_optimization_threads: Option<MaxOptimizationThreads>,
 }
 
 impl std::hash::Hash for OptimizersConfigDiff {
@@ -191,11 +202,35 @@ impl DiffConfig<HnswConfig> for HnswConfigDiff {}
 
 impl DiffConfig<HnswConfigDiff> for HnswConfigDiff {}
 
-impl DiffConfig<OptimizersConfig> for OptimizersConfigDiff {}
+impl DiffConfig<OptimizersConfig> for OptimizersConfigDiff {
+    fn update(self, config: &OptimizersConfig) -> CollectionResult<OptimizersConfig>
+    where
+        Self: Sized + Serialize + DeserializeOwned + Merge,
+    {
+        Ok(OptimizersConfig {
+            deleted_threshold: self.deleted_threshold.unwrap_or(config.deleted_threshold),
+            vacuum_min_vector_number: self
+                .vacuum_min_vector_number
+                .unwrap_or(config.vacuum_min_vector_number),
+            default_segment_number: self
+                .default_segment_number
+                .unwrap_or(config.default_segment_number),
+            max_segment_size: self.max_segment_size.or(config.max_segment_size),
+            memmap_threshold: self.memmap_threshold.or(config.memmap_threshold),
+            indexing_threshold: self.indexing_threshold.or(config.indexing_threshold),
+            flush_interval_sec: self.flush_interval_sec.unwrap_or(config.flush_interval_sec),
+            max_optimization_threads: self
+                .max_optimization_threads
+                .map_or(config.max_optimization_threads, From::from),
+        })
+    }
+}
 
 impl DiffConfig<WalConfig> for WalConfigDiff {}
 
 impl DiffConfig<CollectionParams> for CollectionParamsDiff {}
+
+impl DiffConfig<StrictModeConfig> for StrictModeConfig {}
 
 impl From<HnswConfig> for HnswConfigDiff {
     fn from(config: HnswConfig) -> Self {
@@ -322,25 +357,19 @@ impl Validate for QuantizationConfigDiff {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU64;
-
+    use rstest::rstest;
     use segment::types::{Distance, HnswConfig};
 
     use super::*;
-    use crate::operations::types::VectorParams;
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
     use crate::optimizers_builder::OptimizersConfig;
 
     #[test]
     fn test_update_collection_params() {
         let params = CollectionParams {
-            vectors: VectorParams {
-                size: NonZeroU64::new(128).unwrap(),
-                distance: Distance::Cosine,
-                hnsw_config: None,
-                quantization_config: None,
-                on_disk: None,
-            }
-            .into(),
+            vectors: VectorParamsBuilder::new(128, Distance::Cosine)
+                .build()
+                .into(),
             ..CollectionParams::empty()
         };
 
@@ -355,7 +384,7 @@ mod tests {
 
         assert_eq!(new_params.replication_factor.get(), 1);
         assert_eq!(new_params.write_consistency_factor.get(), 2);
-        assert!(!new_params.on_disk_payload);
+        assert!(new_params.on_disk_payload);
     }
 
     #[test]
@@ -376,12 +405,37 @@ mod tests {
             memmap_threshold: None,
             indexing_threshold: Some(50_000),
             flush_interval_sec: 30,
-            max_optimization_threads: 1,
+            max_optimization_threads: Some(1),
         };
         let update: OptimizersConfigDiff =
             serde_json::from_str(r#"{ "indexing_threshold": 10000 }"#).unwrap();
         let new_config = update.update(&base_config).unwrap();
         assert_eq!(new_config.indexing_threshold, Some(10000))
+    }
+
+    #[rstest]
+    #[case::number(r#"{ "max_optimization_threads": 5 }"#, Some(5))]
+    #[case::auto(r#"{ "max_optimization_threads": "auto" }"#, None)]
+    #[case::null(r#"{ "max_optimization_threads": null }"#, Some(1))] // no effect
+    #[case::nothing("{  }", Some(1))] // no effect
+    #[should_panic]
+    #[case::other(r#"{ "max_optimization_threads": "other" }"#, Some(1))]
+    fn test_set_optimizer_threads(#[case] json_diff: &str, #[case] expected: Option<usize>) {
+        let base_config = OptimizersConfig {
+            deleted_threshold: 0.9,
+            vacuum_min_vector_number: 1000,
+            default_segment_number: 10,
+            max_segment_size: None,
+            memmap_threshold: None,
+            indexing_threshold: Some(50_000),
+            flush_interval_sec: 30,
+            max_optimization_threads: Some(1),
+        };
+
+        let update: OptimizersConfigDiff = serde_json::from_str(json_diff).unwrap();
+        let new_config = update.update(&base_config).unwrap();
+
+        assert_eq!(new_config.max_optimization_threads, expected);
     }
 
     #[test]

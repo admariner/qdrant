@@ -3,6 +3,7 @@ use std::path::Path;
 use memmap2::{Mmap, MmapMut};
 use memory::madvise;
 
+#[derive(Debug)]
 pub struct QuantizedMmapStorage {
     mmap: Mmap,
 }
@@ -71,12 +72,16 @@ impl QuantizedMmapStorageBuilder {
     ) -> std::io::Result<Self> {
         let encoded_storage_size = quantized_vector_size * vectors_count;
         path.parent().map(std::fs::create_dir_all);
+
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
+            // Don't truncate because we explicitly set the length later
+            .truncate(false)
             .open(path)?;
         file.set_len(encoded_storage_size as u64)?;
+
         let mmap = unsafe { MmapMut::map_mut(&file) }?;
         madvise::madvise(&mmap, madvise::get_global())?;
         Ok(Self {

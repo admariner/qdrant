@@ -3,8 +3,10 @@ const NUM_VECTORS_2: u64 = 500;
 
 use std::sync::atomic::AtomicBool;
 
+use common::cpu::CpuPermit;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::entry::entry_point::SegmentEntry;
+use segment::index::hnsw_index::num_rayon_threads;
 use segment::segment::Segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::segment_constructor::simple_segment_constructor::build_multivec_segment;
@@ -27,7 +29,7 @@ fn test_rebuild_with_removed_vectors() {
             .upsert_point(
                 1,
                 i.into(),
-                NamedVectors::from([
+                NamedVectors::from_pairs([
                     ("vector1".to_string(), vec![i as f32, 0., 0., 0.]),
                     ("vector2".to_string(), vec![0., i as f32, 0., 0., 0., 0.]),
                 ]),
@@ -37,9 +39,9 @@ fn test_rebuild_with_removed_vectors() {
 
     for i in 0..NUM_VECTORS_2 {
         let vectors = if i % 5 == 0 {
-            NamedVectors::from([("vector1".to_string(), vec![0., 0., i as f32, 0.])])
+            NamedVectors::from_pairs([("vector1".to_string(), vec![0., 0., i as f32, 0.])])
         } else {
-            NamedVectors::from([
+            NamedVectors::from_pairs([
                 ("vector1".to_string(), vec![0., 0., i as f32, 0.]),
                 ("vector2".to_string(), vec![0., 0., 0., i as f32, 0., 0.]),
             ])
@@ -85,10 +87,12 @@ fn test_rebuild_with_removed_vectors() {
     let mut builder =
         SegmentBuilder::new(dir.path(), temp_dir.path(), &segment1.segment_config).unwrap();
 
-    builder.update_from(&segment1, &stopped).unwrap();
-    builder.update_from(&segment2, &stopped).unwrap();
+    builder.update(&[&segment1, &segment2], &stopped).unwrap();
 
-    let merged_segment: Segment = builder.build(&stopped).unwrap();
+    let permit_cpu_count = num_rayon_threads(0);
+    let permit = CpuPermit::dummy(permit_cpu_count as u32);
+
+    let merged_segment: Segment = builder.build(permit, &stopped).unwrap();
 
     let merged_points_count = merged_segment.available_point_count();
 

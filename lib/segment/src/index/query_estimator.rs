@@ -8,7 +8,7 @@ use std::cmp::{max, min};
 use itertools::Itertools;
 
 use crate::index::field_index::{CardinalityEstimation, PrimaryCondition};
-use crate::types::{Condition, Filter};
+use crate::types::{Condition, Filter, MinShould};
 
 /// Re-estimate cardinality based on number of available vectors
 /// Assuming that deleted vectors are not correlated with the filter
@@ -22,29 +22,6 @@ use crate::types::{Condition, Filter};
 /// # Result
 ///
 /// * `CardinalityEstimation` - new cardinality estimation
-///
-/// # Example
-///
-/// ```
-/// use segment::index::field_index::CardinalityEstimation;
-/// let estimation = CardinalityEstimation {
-///    primary_clauses: vec![],
-///   min: 0,
-///   exp: 64,
-///   max: 100
-/// };
-///
-/// let new_estimation = segment::index::query_estimator::adjust_to_available_vectors(
-///     estimation,
-///     50,
-///     200
-/// );
-///
-/// assert_eq!(new_estimation.min, 0);
-/// assert_eq!(new_estimation.exp, 16);
-/// assert_eq!(new_estimation.max, 50);
-///
-/// ```
 pub fn adjust_to_available_vectors(
     estimation: CardinalityEstimation,
     available_vectors: usize,
@@ -72,21 +49,11 @@ pub fn adjust_to_available_vectors(
 
     debug_assert!(
         min <= exp,
-        "estimation: {:?}, available_vectors: {}, available_points: {}, min: {}, exp: {}",
-        estimation,
-        available_vectors,
-        available_points,
-        min,
-        exp
+        "estimation: {estimation:?}, available_vectors: {available_vectors}, available_points: {available_points}, min: {min}, exp: {exp}"
     );
     debug_assert!(
         exp <= max,
-        "estimation: {:?}, available_vectors: {}, available_points: {}, exp: {}, max: {}",
-        estimation,
-        available_vectors,
-        available_points,
-        exp,
-        max
+        "estimation: {estimation:?}, available_vectors: {available_vectors}, available_points: {available_points}, exp: {exp}, max: {max}"
     );
 
     CardinalityEstimation {
@@ -123,6 +90,27 @@ pub fn combine_should_estimations(
         exp: expected_count,
         max: min(estimations.iter().map(|x| x.max).sum(), total),
     }
+}
+
+pub fn combine_min_should_estimations(
+    estimations: &[CardinalityEstimation],
+    min_count: usize,
+    total: usize,
+) -> CardinalityEstimation {
+    /*
+    | First estimate cardinality of intersections and then combine the estimations
+    | ex) min_count : 2, # of estimations : 4
+    | |(A ⋂ B) ∪ (A ⋂ C) ∪ (A ⋂ D) ∪ (B ⋂ C) ∪ (B ⋂ D) ∪ (C ⋂ D)|
+     */
+    let intersection_estimations = estimations
+        .iter()
+        .combinations(min_count)
+        .map(|intersection| {
+            combine_must_estimations(&intersection.into_iter().cloned().collect_vec(), total)
+        })
+        .collect_vec();
+
+    combine_should_estimations(&intersection_estimations, total)
 }
 
 pub fn combine_must_estimations(
@@ -196,6 +184,15 @@ where
             }
         }
     }
+    match &filter.min_should {
+        None => {}
+        Some(MinShould {
+            conditions,
+            min_count,
+        }) => filter_estimations.push(estimate_min_should(
+            estimator, conditions, *min_count, total,
+        )),
+    }
     match &filter.must_not {
         None => {}
         Some(conditions) => {
@@ -219,6 +216,20 @@ where
     let estimate = |x| estimate_condition(estimator, x, total);
     let should_estimations = conditions.iter().map(estimate).collect_vec();
     combine_should_estimations(&should_estimations, total)
+}
+
+fn estimate_min_should<F>(
+    estimator: &F,
+    conditions: &[Condition],
+    min_count: usize,
+    total: usize,
+) -> CardinalityEstimation
+where
+    F: Fn(&Condition) -> CardinalityEstimation,
+{
+    let estimate = |x| estimate_condition(estimator, x, total);
+    let min_should_estimations = conditions.iter().map(estimate).collect_vec();
+    combine_min_should_estimations(&min_should_estimations, min_count, total)
 }
 
 fn estimate_must<F>(estimator: &F, conditions: &[Condition], total: usize) -> CardinalityEstimation
@@ -258,17 +269,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::iter::FromIterator;
-
     use super::*;
+    use crate::json_path::JsonPath;
     use crate::types::{FieldCondition, HasIdCondition};
 
     const TOTAL: usize = 1000;
 
-    fn test_condition(key: String) -> Condition {
+    fn test_condition(key: &str) -> Condition {
         Condition::Field(FieldCondition {
-            key,
+            key: JsonPath::new(key),
             r#match: None,
             range: None,
             geo_bounding_box: None,
@@ -282,21 +291,22 @@ mod tests {
         match condition {
             Condition::Filter(_) => panic!("unexpected Filter"),
             Condition::Nested(_) => panic!("unexpected Nested"),
-            Condition::Field(field) => match field.key.as_str() {
+            Condition::CustomIdChecker(_) => panic!("unexpected CustomIdChecker"),
+            Condition::Field(field) => match field.key.to_string().as_str() {
                 "color" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 100,
                     exp: 200,
                     max: 300,
                 },
                 "size" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 100,
                     exp: 100,
                     max: 100,
                 },
                 "price" => CardinalityEstimation {
-                    primary_clauses: vec![PrimaryCondition::Condition(field.clone())],
+                    primary_clauses: vec![PrimaryCondition::Condition(Box::new(field.clone()))],
                     min: 10,
                     exp: 15,
                     max: 20,
@@ -327,12 +337,18 @@ mod tests {
                 exp: TOTAL / 2,
                 max: TOTAL,
             },
+            Condition::HasVector(condition) => CardinalityEstimation {
+                primary_clauses: vec![PrimaryCondition::HasVector(condition.has_vector.clone())],
+                min: 0,
+                exp: TOTAL / 2,
+                max: TOTAL,
+            },
         }
     }
 
     #[test]
     fn simple_query_estimation_test() {
-        let query = Filter::new_must(test_condition("color".to_owned()));
+        let query = Filter::new_must(test_condition("color"));
         let estimation = estimate_filter(&test_estimator, &query, TOTAL);
         assert_eq!(estimation.exp, 200);
         assert!(!estimation.primary_clauses.is_empty());
@@ -342,10 +358,11 @@ mod tests {
     fn must_estimation_query_test() {
         let query = Filter {
             should: None,
+            min_should: None,
             must: Some(vec![
-                test_condition("color".to_owned()),
-                test_condition("size".to_owned()),
-                test_condition("un-indexed".to_owned()),
+                test_condition("color"),
+                test_condition("size"),
+                test_condition("un-indexed"),
             ]),
             must_not: None,
         };
@@ -353,7 +370,7 @@ mod tests {
         let estimation = estimate_filter(&test_estimator, &query, TOTAL);
         assert_eq!(estimation.primary_clauses.len(), 1);
         match &estimation.primary_clauses[0] {
-            PrimaryCondition::Condition(field) => assert_eq!(&field.key, "size"),
+            PrimaryCondition::Condition(field) => assert_eq!(&field.key.to_string(), "size"),
             _ => panic!(),
         }
         assert!(estimation.max <= TOTAL);
@@ -364,10 +381,8 @@ mod tests {
     #[test]
     fn should_estimation_query_test() {
         let query = Filter {
-            should: Some(vec![
-                test_condition("color".to_owned()),
-                test_condition("size".to_owned()),
-            ]),
+            should: Some(vec![test_condition("color"), test_condition("size")]),
+            min_should: None,
             must: None,
             must_not: None,
         };
@@ -383,10 +398,11 @@ mod tests {
     fn another_should_estimation_query_test() {
         let query = Filter {
             should: Some(vec![
-                test_condition("color".to_owned()),
-                test_condition("size".to_owned()),
-                test_condition("un-indexed".to_owned()),
+                test_condition("color"),
+                test_condition("size"),
+                test_condition("un-indexed"),
             ]),
+            min_should: None,
             must: None,
             must_not: None,
         };
@@ -400,29 +416,89 @@ mod tests {
     }
 
     #[test]
+    fn min_should_estimation_query_test() {
+        let query = Filter::new_min_should(MinShould {
+            conditions: vec![test_condition("color"), test_condition("size")],
+            min_count: 1,
+        });
+        let estimation = estimate_filter(&test_estimator, &query, TOTAL);
+        assert_eq!(estimation.primary_clauses.len(), 2);
+        assert!(estimation.max <= TOTAL);
+        assert!(estimation.exp <= estimation.max);
+        assert!(estimation.min <= estimation.exp);
+    }
+
+    #[test]
+    fn another_min_should_estimation_query_test() {
+        let query = Filter::new_min_should(MinShould {
+            conditions: vec![
+                test_condition("color"),
+                test_condition("size"),
+                test_condition("price"),
+            ],
+            min_count: 2,
+        });
+
+        let estimation = estimate_filter(&test_estimator, &query, TOTAL);
+        assert_eq!(estimation.primary_clauses.len(), 3);
+        assert!(estimation.max <= TOTAL);
+        assert!(estimation.exp <= estimation.max);
+        assert!(estimation.min <= estimation.exp);
+    }
+
+    #[test]
+    fn min_should_with_min_count_same_as_condition_count_is_equivalent_to_must() {
+        let conditions = vec![
+            test_condition("color"),
+            test_condition("size"),
+            test_condition("price"),
+        ];
+        let min_should_query = Filter::new_min_should(MinShould {
+            conditions: conditions.clone(),
+            min_count: 3,
+        });
+
+        let estimation = estimate_filter(&test_estimator, &min_should_query, TOTAL);
+
+        let must_query = Filter {
+            should: None,
+            min_should: None,
+            must: Some(conditions),
+            must_not: None,
+        };
+
+        let expected_estimation = estimate_filter(&test_estimator, &must_query, TOTAL);
+
+        assert_eq!(
+            estimation.primary_clauses,
+            expected_estimation.primary_clauses
+        );
+        assert_eq!(estimation.max, expected_estimation.max);
+        assert_eq!(estimation.exp, expected_estimation.exp);
+        assert_eq!(estimation.min, expected_estimation.min);
+    }
+
+    #[test]
     fn complex_estimation_query_test() {
         let query = Filter {
             should: Some(vec![
                 Condition::Filter(Filter {
                     should: None,
-                    must: Some(vec![
-                        test_condition("color".to_owned()),
-                        test_condition("size".to_owned()),
-                    ]),
+                    min_should: None,
+                    must: Some(vec![test_condition("color"), test_condition("size")]),
                     must_not: None,
                 }),
                 Condition::Filter(Filter {
                     should: None,
-                    must: Some(vec![
-                        test_condition("price".to_owned()),
-                        test_condition("size".to_owned()),
-                    ]),
+                    min_should: None,
+                    must: Some(vec![test_condition("price"), test_condition("size")]),
                     must_not: None,
                 }),
             ]),
+            min_should: None,
             must: None,
             must_not: Some(vec![Condition::HasId(HasIdCondition {
-                has_id: HashSet::from_iter([1, 2, 3, 4, 5].into_iter().map(|x| x.into())),
+                has_id: [1, 2, 3, 4, 5].into_iter().map(|x| x.into()).collect(),
             })]),
         };
 
@@ -437,26 +513,23 @@ mod tests {
     fn another_complex_estimation_query_test() {
         let query = Filter {
             should: None,
+            min_should: None,
             must: Some(vec![
                 Condition::Filter(Filter {
                     must: None,
-                    should: Some(vec![
-                        test_condition("color".to_owned()),
-                        test_condition("size".to_owned()),
-                    ]),
+                    should: Some(vec![test_condition("color"), test_condition("size")]),
+                    min_should: None,
                     must_not: None,
                 }),
                 Condition::Filter(Filter {
                     must: None,
-                    should: Some(vec![
-                        test_condition("price".to_owned()),
-                        test_condition("size".to_owned()),
-                    ]),
+                    should: Some(vec![test_condition("price"), test_condition("size")]),
+                    min_should: None,
                     must_not: None,
                 }),
             ]),
             must_not: Some(vec![Condition::HasId(HasIdCondition {
-                has_id: HashSet::from_iter([1, 2, 3, 4, 5].into_iter().map(|x| x.into())),
+                has_id: [1, 2, 3, 4, 5].into_iter().map(|x| x.into()).collect(),
             })]),
         };
 
@@ -464,7 +537,7 @@ mod tests {
         assert_eq!(estimation.primary_clauses.len(), 2);
         estimation.primary_clauses.iter().for_each(|x| match x {
             PrimaryCondition::Condition(field) => {
-                assert!(["price".to_owned(), "size".to_owned()].contains(&field.key))
+                assert!(["price", "size"].contains(&field.key.to_string().as_str()))
             }
             _ => panic!("Should not go here"),
         });
@@ -484,5 +557,21 @@ mod tests {
 
         let res = combine_must_estimations(&estimations, 10_000);
         eprintln!("res = {res:#?}");
+    }
+
+    #[test]
+    fn test_adjust_to_available_vectors() {
+        let estimation = CardinalityEstimation {
+            primary_clauses: vec![],
+            min: 0,
+            exp: 64,
+            max: 100,
+        };
+
+        let new_estimation = adjust_to_available_vectors(estimation, 50, 200);
+
+        assert_eq!(new_estimation.min, 0);
+        assert_eq!(new_estimation.exp, 16);
+        assert_eq!(new_estimation.max, 50);
     }
 }

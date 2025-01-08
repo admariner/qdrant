@@ -5,6 +5,7 @@ use atomic_refcell::AtomicRefCell;
 use common::types::PointOffsetType;
 
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
+use crate::payload_storage::PayloadStorage;
 use crate::types::{OwnedPayloadRef, Payload};
 
 #[derive(Clone)]
@@ -27,11 +28,12 @@ impl PayloadProvider {
     {
         let payload_storage_guard = self.payload_storage.borrow();
         let payload_ptr_opt = match payload_storage_guard.deref() {
+            #[cfg(feature = "testing")]
             PayloadStorageEnum::InMemoryPayloadStorage(s) => {
-                s.payload_ptr(point_id).map(|x| x.into())
+                s.payload_ptr(point_id).map(OwnedPayloadRef::from)
             }
             PayloadStorageEnum::SimplePayloadStorage(s) => {
-                s.payload_ptr(point_id).map(|x| x.into())
+                s.payload_ptr(point_id).map(OwnedPayloadRef::from)
             }
             // Warn: Possible panic here
             // Currently, it is possible that `read_payload` fails with Err,
@@ -49,13 +51,19 @@ impl PayloadProvider {
             PayloadStorageEnum::OnDiskPayloadStorage(s) => s
                 .read_payload(point_id)
                 .unwrap_or_else(|err| panic!("Payload storage is corrupted: {err}"))
-                .map(|x| x.into()),
+                .map(OwnedPayloadRef::from),
+            PayloadStorageEnum::MmapPayloadStorage(s) => {
+                let payload = s
+                    .get(point_id)
+                    .unwrap_or_else(|err| panic!("Payload storage is corrupted: {err}"));
+                Some(OwnedPayloadRef::from(payload))
+            }
         };
 
         let payload = if let Some(payload_ptr) = payload_ptr_opt {
             payload_ptr
         } else {
-            (&self.empty_payload).into()
+            OwnedPayloadRef::from(&self.empty_payload)
         };
 
         callback(payload)

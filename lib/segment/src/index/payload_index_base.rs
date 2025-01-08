@@ -4,10 +4,11 @@ use std::path::{Path, PathBuf};
 use common::types::PointOffsetType;
 use serde_json::Value;
 
+use super::field_index::FieldIndex;
 use crate::common::operation_error::OperationResult;
-use crate::common::utils::JsonPathPayload;
 use crate::common::Flusher;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
+use crate::json_path::JsonPath;
 use crate::payload_storage::FilterContext;
 use crate::types::{
     Filter, Payload, PayloadFieldSchema, PayloadKeyType, PayloadKeyTypeRef, PayloadSchemaType,
@@ -17,12 +18,37 @@ pub trait PayloadIndex {
     /// Get indexed fields
     fn indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
 
+    /// Build the index, if not built before, taking the caller by reference only
+    fn build_index(
+        &self,
+        field: PayloadKeyTypeRef,
+        payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<Option<Vec<FieldIndex>>>;
+
+    /// Apply already built indexes
+    fn apply_index(
+        &mut self,
+        field: PayloadKeyType,
+        payload_schema: PayloadFieldSchema,
+        field_index: Vec<FieldIndex>,
+    ) -> OperationResult<()>;
+
     /// Mark field as one which should be indexed
     fn set_indexed(
         &mut self,
         field: PayloadKeyTypeRef,
-        payload_schema: PayloadFieldSchema,
-    ) -> OperationResult<()>;
+        payload_schema: impl Into<PayloadFieldSchema>,
+    ) -> OperationResult<()> {
+        let payload_schema = payload_schema.into();
+
+        let Some(field_index) = self.build_index(field, &payload_schema)? else {
+            return Ok(());
+        };
+
+        self.apply_index(field.to_owned(), payload_schema, field_index)?;
+
+        Ok(())
+    }
 
     /// Remove index
     fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<()>;
@@ -36,7 +62,7 @@ pub trait PayloadIndex {
     fn estimate_nested_cardinality(
         &self,
         query: &Filter,
-        nested_path: &JsonPathPayload,
+        nested_path: &JsonPath,
     ) -> CardinalityEstimation;
 
     /// Return list of all point ids, which satisfy filtering criteria
@@ -57,28 +83,33 @@ pub trait PayloadIndex {
         threshold: usize,
     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_>;
 
-    /// Assign same payload to each given point
-    fn assign_all(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
-        self.drop(point_id)?;
-        self.assign(point_id, payload)?;
-        Ok(())
-    }
+    /// Overwrite payload for point_id. If payload already exists, replace it.
+    fn overwrite_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+    ) -> OperationResult<()>;
 
     /// Assign payload to a concrete point with a concrete payload value
-    fn assign(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()>;
+    fn set_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        key: &Option<JsonPath>,
+    ) -> OperationResult<()>;
 
     /// Get payload for point
-    fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload>;
+    fn get_payload(&self, point_id: PointOffsetType) -> OperationResult<Payload>;
 
     /// Delete payload by key
-    fn delete(
+    fn delete_payload(
         &mut self,
         point_id: PointOffsetType,
         key: PayloadKeyTypeRef,
     ) -> OperationResult<Vec<Value>>;
 
     /// Drop all payload of the point
-    fn drop(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>>;
+    fn clear_payload(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>>;
 
     /// Return function that forces persistence of current storage state.
     fn flusher(&self) -> Flusher;

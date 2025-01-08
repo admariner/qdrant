@@ -1,37 +1,34 @@
-use std::collections::BTreeMap;
-use std::ops::Bound::{Excluded, Unbounded};
-use std::ops::{Bound, Range};
+use std::collections::BTreeSet;
+use std::ops::Bound;
 use std::sync::Arc;
 
+use bitvec::vec::BitVec;
 use common::types::PointOffsetType;
 use parking_lot::RwLock;
 use rocksdb::DB;
 
-use super::mutable_numeric_index::MutableNumericIndex;
-use super::{Encodable, NumericIndex, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION};
+use super::mutable_numeric_index::{InMemoryNumericIndex, MutableNumericIndex};
+use super::{
+    numeric_index_storage_cf_name, Encodable, HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION,
+};
 use crate::common::operation_error::OperationResult;
+use crate::common::rocksdb_buffered_delete_wrapper::DatabaseColumnScheduledDeleteWrapper;
 use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::index::field_index::histogram::{Histogram, Numericable, Point};
+use crate::index::field_index::immutable_point_to_values::ImmutablePointToValues;
 
-pub struct ImmutableNumericIndex<T: Encodable + Numericable> {
+pub struct ImmutableNumericIndex<T: Encodable + Numericable + Default> {
     map: NumericKeySortedVec<T>,
-    db_wrapper: DatabaseColumnWrapper,
-    pub(super) histogram: Histogram<T>,
-    pub(super) points_count: usize,
-    pub(super) max_values_per_point: usize,
-    point_to_values: Vec<Range<u32>>,
-    point_to_values_container: Vec<T>,
+    db_wrapper: DatabaseColumnScheduledDeleteWrapper,
+    histogram: Histogram<T>,
+    points_count: usize,
+    max_values_per_point: usize,
+    point_to_values: ImmutablePointToValues<T>,
 }
 
-#[derive(Clone, PartialEq, Debug)]
-pub(super) struct NumericIndexKey<T> {
-    key: T,
-    idx: PointOffsetType,
-    deleted: bool,
-}
-
-struct NumericKeySortedVec<T: Encodable + Numericable> {
-    data: Vec<NumericIndexKey<T>>,
+pub(super) struct NumericKeySortedVec<T: Encodable + Numericable> {
+    data: Vec<Point<T>>,
+    deleted: BitVec,
     deleted_count: usize,
 }
 
@@ -41,73 +38,11 @@ pub(super) struct NumericKeySortedVecIterator<'a, T: Encodable + Numericable> {
     end_index: usize,
 }
 
-impl<T: PartialEq + PartialOrd + Encodable + Numericable> NumericIndexKey<T> {
-    pub(super) fn new(key: T, idx: PointOffsetType) -> Self {
-        Self {
-            key,
-            idx,
-            deleted: false,
-        }
-    }
-
-    pub(super) fn encode(&self) -> Vec<u8> {
-        T::encode_key(&self.key, self.idx)
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> Self {
-        let (idx, key) = T::decode_key(bytes);
-        Self {
-            key,
-            idx,
-            deleted: false,
-        }
-    }
-}
-
-impl<T> From<NumericIndexKey<T>> for Point<T> {
-    fn from(key: NumericIndexKey<T>) -> Self {
-        Point {
-            val: key.key,
-            idx: key.idx as usize,
-        }
-    }
-}
-
-impl<T> From<Point<T>> for NumericIndexKey<T> {
-    fn from(key: Point<T>) -> Self {
-        NumericIndexKey {
-            key: key.val,
-            idx: key.idx as PointOffsetType,
-            deleted: false,
-        }
-    }
-}
-
-impl<T: PartialEq + PartialOrd + Encodable> PartialOrd for NumericIndexKey<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: PartialEq + PartialOrd + Encodable> Ord for NumericIndexKey<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        match self.key.cmp_encoded(&other.key) {
-            std::cmp::Ordering::Equal => self.idx.cmp(&other.idx),
-            ord => ord,
-        }
-    }
-}
-
-impl<T: PartialEq + PartialOrd + Encodable> Eq for NumericIndexKey<T> {}
-
 impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
-    fn from_btree_map(map: BTreeMap<Vec<u8>, u32>) -> Self {
+    fn from_btree_set(map: BTreeSet<Point<T>>) -> Self {
         Self {
-            data: map
-                .keys()
-                .cloned()
-                .map(|b| NumericIndexKey::<T>::decode(&b))
-                .collect(),
+            deleted: BitVec::repeat(false, map.len()),
+            data: map.into_iter().collect(),
             deleted_count: 0,
         }
     }
@@ -116,23 +51,26 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         self.data.len() - self.deleted_count
     }
 
-    fn remove(&mut self, key: NumericIndexKey<T>) -> bool {
-        if let Ok(index) = self.data.binary_search(&key) {
-            self.data[index].deleted = true;
-            self.deleted_count += 1;
-            true
-        } else {
-            false
+    fn remove(&mut self, key: &Point<T>) -> bool {
+        if let Ok(index) = self.data.binary_search(key) {
+            if let Some(is_deleted) = self.deleted.get_mut(index).as_deref_mut() {
+                if !*is_deleted {
+                    self.deleted_count += 1;
+                    *is_deleted = true;
+                }
+                return true;
+            }
         }
+        false
     }
 
     fn values_range(
         &self,
-        start_bound: Bound<NumericIndexKey<T>>,
-        end_bound: Bound<NumericIndexKey<T>>,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
     ) -> NumericKeySortedVecIterator<'_, T> {
         let start_index = self.find_start_index(start_bound);
-        let end_index = self.find_end_index(end_bound);
+        let end_index = self.find_end_index(start_index, end_bound);
         NumericKeySortedVecIterator {
             set: self,
             start_index,
@@ -140,7 +78,7 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         }
     }
 
-    fn find_start_index(&self, bound: Bound<NumericIndexKey<T>>) -> usize {
+    pub(super) fn find_start_index(&self, bound: Bound<Point<T>>) -> usize {
         match bound {
             Bound::Included(bound) => self.data.binary_search(&bound).unwrap_or_else(|idx| idx),
             Bound::Excluded(bound) => match self.data.binary_search(&bound) {
@@ -151,26 +89,40 @@ impl<T: Encodable + Numericable> NumericKeySortedVec<T> {
         }
     }
 
-    fn find_end_index(&self, bound: Bound<NumericIndexKey<T>>) -> usize {
+    pub(super) fn find_end_index(&self, start: usize, bound: Bound<Point<T>>) -> usize {
+        if start >= self.data.len() {
+            // the range `end` should never be less than `start`
+            return start;
+        }
         match bound {
-            Bound::Included(bound) => match self.data.binary_search(&bound) {
-                Ok(idx) => idx + 1,
-                Err(idx) => idx,
+            Bound::Included(bound) => match self.data[start..].binary_search(&bound) {
+                Ok(idx) => idx + 1 + start,
+                Err(idx) => idx + start,
             },
-            Bound::Excluded(bound) => self.data.binary_search(&bound).unwrap_or_else(|idx| idx),
+            Bound::Excluded(bound) => {
+                let end_bound = self.data[start..].binary_search(&bound);
+                end_bound.unwrap_or_else(|idx| idx) + start
+            }
             Bound::Unbounded => self.data.len(),
         }
     }
 }
 
-impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a, T> {
-    type Item = NumericIndexKey<T>;
+impl<T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'_, T> {
+    type Item = Point<T>;
 
     fn next(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.start_index].clone();
+            let deleted = self
+                .set
+                .deleted
+                .get(self.start_index)
+                .as_deref()
+                .copied()
+                .unwrap_or(true);
             self.start_index += 1;
-            if key.deleted {
+            if deleted {
                 continue;
             }
             return Some(key);
@@ -179,12 +131,19 @@ impl<'a, T: Encodable + Numericable> Iterator for NumericKeySortedVecIterator<'a
     }
 }
 
-impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'a, T> {
+impl<T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVecIterator<'_, T> {
     fn next_back(&mut self) -> Option<Self::Item> {
         while self.start_index < self.end_index {
             let key = self.set.data[self.end_index - 1].clone();
+            let deleted = self
+                .set
+                .deleted
+                .get(self.end_index - 1)
+                .as_deref()
+                .copied()
+                .unwrap_or(true);
             self.end_index -= 1;
-            if key.deleted {
+            if deleted {
                 continue;
             }
             return Some(key);
@@ -193,13 +152,17 @@ impl<'a, T: Encodable + Numericable> DoubleEndedIterator for NumericKeySortedVec
     }
 }
 
-impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
+impl<T: Encodable + Numericable + Default> ImmutableNumericIndex<T> {
     pub(super) fn new(db: Arc<RwLock<DB>>, field: &str) -> Self {
-        let store_cf_name = NumericIndex::<T>::storage_cf_name(field);
-        let db_wrapper = DatabaseColumnWrapper::new(db, &store_cf_name);
+        let store_cf_name = numeric_index_storage_cf_name(field);
+        let db_wrapper = DatabaseColumnScheduledDeleteWrapper::new(DatabaseColumnWrapper::new(
+            db,
+            &store_cf_name,
+        ));
         Self {
             map: NumericKeySortedVec {
                 data: Default::default(),
+                deleted: BitVec::new(),
                 deleted_count: 0,
             },
             db_wrapper,
@@ -207,103 +170,127 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
             points_count: 0,
             max_values_per_point: 1,
             point_to_values: Default::default(),
-            point_to_values_container: Default::default(),
         }
     }
 
-    pub(super) fn get_db_wrapper(&self) -> &DatabaseColumnWrapper {
+    pub(super) fn get_db_wrapper(&self) -> &DatabaseColumnScheduledDeleteWrapper {
         &self.db_wrapper
     }
 
-    pub(super) fn get_values(&self, idx: PointOffsetType) -> Option<&[T]> {
-        let range = self.point_to_values.get(idx as usize)?.clone();
-        let range = range.start as usize..range.end as usize;
-        Some(&self.point_to_values_container[range])
+    pub(super) fn check_values_any(
+        &self,
+        idx: PointOffsetType,
+        check_fn: impl Fn(&T) -> bool,
+    ) -> bool {
+        self.point_to_values.check_values_any(idx, check_fn)
     }
 
-    pub(super) fn get_values_count(&self) -> usize {
+    pub fn get_values(&self, idx: PointOffsetType) -> Option<Box<dyn Iterator<Item = T> + '_>> {
+        Some(Box::new(
+            self.point_to_values
+                .get_values(idx)
+                .map(|iter| iter.copied())?,
+        ))
+    }
+
+    pub fn values_count(&self, idx: PointOffsetType) -> Option<usize> {
+        self.point_to_values.get_values_count(idx)
+    }
+
+    pub(super) fn total_unique_values_count(&self) -> usize {
         self.map.len()
+    }
+
+    pub(super) fn values_range_size(
+        &self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+    ) -> usize {
+        let iterator = self.map.values_range(start_bound, end_bound);
+        iterator.end_index - iterator.start_index
     }
 
     pub(super) fn values_range(
         &self,
-        start_bound: Bound<NumericIndexKey<T>>,
-        end_bound: Bound<NumericIndexKey<T>>,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
     ) -> impl Iterator<Item = PointOffsetType> + '_ {
         self.map
             .values_range(start_bound, end_bound)
-            .map(|NumericIndexKey { idx, .. }| idx)
+            .map(|Point { idx, .. }| idx)
+    }
+
+    pub(super) fn orderable_values_range(
+        &self,
+        start_bound: Bound<Point<T>>,
+        end_bound: Bound<Point<T>>,
+    ) -> impl DoubleEndedIterator<Item = (T, PointOffsetType)> + '_ {
+        self.map
+            .values_range(start_bound, end_bound)
+            .map(|Point { val, idx, .. }| (val, idx))
     }
 
     pub(super) fn load(&mut self) -> OperationResult<bool> {
-        let mut mutable = MutableNumericIndex::<T> {
-            map: Default::default(),
-            db_wrapper: self.db_wrapper.clone(),
-            histogram: Histogram::new(HISTOGRAM_MAX_BUCKET_SIZE, HISTOGRAM_PRECISION),
-            points_count: 0,
-            max_values_per_point: 0,
-            point_to_values: Default::default(),
-        };
+        let mut mutable = MutableNumericIndex::<T>::new_from_db_wrapper(self.db_wrapper.clone());
         mutable.load()?;
-        let MutableNumericIndex {
+        let InMemoryNumericIndex {
             map,
             histogram,
             points_count,
             max_values_per_point,
             point_to_values,
             ..
-        } = mutable;
+        } = mutable.into_in_memory_index();
 
-        self.map = NumericKeySortedVec::from_btree_map(map);
+        self.map = NumericKeySortedVec::from_btree_set(map);
         self.histogram = histogram;
         self.points_count = points_count;
         self.max_values_per_point = max_values_per_point;
-
-        // flatten points-to-values map
-        for values in point_to_values {
-            let values = values.into_iter().collect::<Vec<_>>();
-            let container_len = self.point_to_values_container.len() as u32;
-            let range = container_len..container_len + values.len() as u32;
-            self.point_to_values.push(range.clone());
-            self.point_to_values_container.extend(values);
-        }
-
+        self.point_to_values = ImmutablePointToValues::new(point_to_values);
         Ok(true)
     }
 
     pub(super) fn remove_point(&mut self, idx: PointOffsetType) -> OperationResult<()> {
-        if self.point_to_values.len() <= idx as usize {
-            return Ok(());
+        if let Some(removed_values) = self.point_to_values.get_values(idx) {
+            let mut removed_count = 0;
+            for value in removed_values {
+                let key = Point::new(*value, idx);
+                Self::remove_from_map(&mut self.map, &mut self.histogram, &key);
+
+                // update db
+                let encoded = value.encode_key(idx);
+                self.db_wrapper.remove(encoded)?;
+
+                removed_count += 1;
+            }
+            if removed_count > 0 {
+                self.points_count -= 1;
+            }
         }
-
-        let removed_values_range = self.point_to_values[idx as usize].clone();
-        self.point_to_values[idx as usize] = Default::default();
-
-        if !removed_values_range.is_empty() {
-            self.points_count -= 1;
-        }
-
-        for value_index in removed_values_range {
-            let value = self.point_to_values_container[value_index as usize];
-            let key = NumericIndexKey::new(value, idx);
-            Self::remove_from_map(&mut self.map, &mut self.histogram, key);
-
-            // update db
-            let encoded = value.encode_key(idx);
-            self.db_wrapper.remove(encoded)?;
-        }
-
+        self.point_to_values.remove_point(idx);
         Ok(())
+    }
+
+    pub(super) fn get_histogram(&self) -> &Histogram<T> {
+        &self.histogram
+    }
+
+    pub(super) fn get_points_count(&self) -> usize {
+        self.points_count
+    }
+
+    pub(super) fn get_max_values_per_point(&self) -> usize {
+        self.max_values_per_point
     }
 
     fn remove_from_map(
         map: &mut NumericKeySortedVec<T>,
         histogram: &mut Histogram<T>,
-        key: NumericIndexKey<T>,
+        key: &Point<T>,
     ) {
-        if map.remove(key.clone()) {
+        if map.remove(key) {
             histogram.remove(
-                &key.into(),
+                key,
                 |x| Self::get_histogram_left_neighbor(map, x),
                 |x| Self::get_histogram_right_neighbor(map, x),
             );
@@ -314,223 +301,154 @@ impl<T: Encodable + Numericable> ImmutableNumericIndex<T> {
         map: &NumericKeySortedVec<T>,
         point: &Point<T>,
     ) -> Option<Point<T>> {
-        let key: NumericIndexKey<T> = point.clone().into();
-        map.values_range(Unbounded, Excluded(key))
+        map.values_range(Bound::Unbounded, Bound::Excluded(point.clone()))
             .next_back()
-            .map(|key| key.into())
     }
 
     fn get_histogram_right_neighbor(
         map: &NumericKeySortedVec<T>,
         point: &Point<T>,
     ) -> Option<Point<T>> {
-        let key: NumericIndexKey<T> = point.clone().into();
-        map.values_range(Excluded(key), Unbounded)
+        map.values_range(Bound::Excluded(point.clone()), Bound::Unbounded)
             .next()
-            .map(|key| key.into())
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::ops::Bound;
-    use std::ops::Bound::{Excluded, Included, Unbounded};
 
     use super::*;
     use crate::types::FloatPayloadType;
 
     fn check_range(
         key_set: &NumericKeySortedVec<FloatPayloadType>,
-        encoded_map: &BTreeMap<Vec<u8>, PointOffsetType>,
-        start_bound: Bound<NumericIndexKey<FloatPayloadType>>,
-        end_bound: Bound<NumericIndexKey<FloatPayloadType>>,
+        encoded_map: &BTreeSet<Point<FloatPayloadType>>,
+        start_bound: Bound<Point<FloatPayloadType>>,
+        end_bound: Bound<Point<FloatPayloadType>>,
     ) {
         let set1 = key_set
             .values_range(start_bound.clone(), end_bound.clone())
             .collect::<Vec<_>>();
 
-        let start_encoded_bound = match start_bound {
-            Included(k) => Included(k.encode()),
-            Excluded(k) => Excluded(k.encode()),
-            Unbounded => Unbounded,
-        };
-        let end_encoded_bound = match end_bound {
-            Included(k) => Included(k.encode()),
-            Excluded(k) => Excluded(k.encode()),
-            Unbounded => Unbounded,
-        };
         let set2 = encoded_map
-            .range((start_encoded_bound, end_encoded_bound))
-            .map(|(b, _)| NumericIndexKey::<FloatPayloadType>::decode(b))
+            .range((start_bound, end_bound))
+            .cloned()
             .collect::<Vec<_>>();
 
         for (k1, k2) in set1.iter().zip(set2.iter()) {
-            if k1.key.is_nan() && k2.key.is_nan() {
-                assert_eq!(k1.idx, k2.idx);
-            } else {
-                assert_eq!(k1, k2);
-            }
+            assert_eq!(k1, k2);
         }
     }
 
     fn check_ranges(
         key_set: &NumericKeySortedVec<FloatPayloadType>,
-        encoded_map: &BTreeMap<Vec<u8>, PointOffsetType>,
+        encoded_map: &BTreeSet<Point<FloatPayloadType>>,
     ) {
         check_range(key_set, encoded_map, Bound::Unbounded, Bound::Unbounded);
         check_range(
             key_set,
             encoded_map,
             Bound::Unbounded,
-            Bound::Included(NumericIndexKey::new(0.4, 2)),
+            Bound::Included(Point::new(0.4, 2)),
         );
         check_range(
             key_set,
             encoded_map,
             Bound::Unbounded,
-            Bound::Excluded(NumericIndexKey::new(0.4, 2)),
+            Bound::Excluded(Point::new(0.4, 2)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Included(NumericIndexKey::new(0.4, 2)),
+            Bound::Included(Point::new(0.4, 2)),
             Bound::Unbounded,
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Excluded(NumericIndexKey::new(0.4, 2)),
+            Bound::Excluded(Point::new(0.4, 2)),
             Bound::Unbounded,
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Included(NumericIndexKey::new(-5.0, 1)),
-            Bound::Included(NumericIndexKey::new(5.0, 1)),
+            Bound::Included(Point::new(-5.0, 1)),
+            Bound::Included(Point::new(5.0, 1)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Included(NumericIndexKey::new(-5.0, 1)),
-            Bound::Excluded(NumericIndexKey::new(5.0, 1)),
+            Bound::Included(Point::new(-5.0, 1)),
+            Bound::Excluded(Point::new(5.0, 1)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Excluded(NumericIndexKey::new(-5.0, 1)),
-            Bound::Included(NumericIndexKey::new(5.0, 1)),
+            Bound::Excluded(Point::new(-5.0, 1)),
+            Bound::Included(Point::new(5.0, 1)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Excluded(NumericIndexKey::new(-5.0, 1)),
-            Bound::Excluded(NumericIndexKey::new(5.0, 1)),
+            Bound::Excluded(Point::new(-5.0, 1)),
+            Bound::Excluded(Point::new(5.0, 1)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Included(NumericIndexKey::new(-5.0, 1000)),
-            Bound::Included(NumericIndexKey::new(5.0, 1000)),
+            Bound::Included(Point::new(-5.0, 1000)),
+            Bound::Included(Point::new(5.0, 1000)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Excluded(NumericIndexKey::new(-5.0, 1000)),
-            Bound::Excluded(NumericIndexKey::new(5.0, 1000)),
+            Bound::Excluded(Point::new(-5.0, 1000)),
+            Bound::Excluded(Point::new(5.0, 1000)),
         );
         check_range(
             key_set,
             encoded_map,
-            Bound::Excluded(NumericIndexKey::new(-50000.0, 1000)),
-            Bound::Excluded(NumericIndexKey::new(50000.0, 1000)),
+            Bound::Excluded(Point::new(-50000.0, 1000)),
+            Bound::Excluded(Point::new(50000.0, 1000)),
         );
     }
 
     #[test]
     fn test_numeric_index_key_set() {
         let pairs = [
-            NumericIndexKey::new(0.0, 1),
-            NumericIndexKey::new(0.0, 3),
-            NumericIndexKey::new(-0.0, 2),
-            NumericIndexKey::new(-0.0, 4),
-            NumericIndexKey::new(0.4, 2),
-            NumericIndexKey::new(-0.4, 3),
-            NumericIndexKey::new(5.0, 1),
-            NumericIndexKey::new(-5.0, 1),
-            NumericIndexKey::new(f64::NAN, 0),
-            NumericIndexKey::new(f64::NAN, 2),
-            NumericIndexKey::new(f64::NAN, 3),
-            NumericIndexKey::new(f64::INFINITY, 0),
-            NumericIndexKey::new(f64::NEG_INFINITY, 1),
-            NumericIndexKey::new(f64::NEG_INFINITY, 2),
-            NumericIndexKey::new(f64::NEG_INFINITY, 3),
+            Point::new(0.0, 1),
+            Point::new(0.0, 3),
+            Point::new(-0.0, 2),
+            Point::new(-0.0, 4),
+            Point::new(0.4, 2),
+            Point::new(-0.4, 3),
+            Point::new(5.0, 1),
+            Point::new(-5.0, 1),
+            Point::new(f64::INFINITY, 0),
+            Point::new(f64::NEG_INFINITY, 1),
+            Point::new(f64::NEG_INFINITY, 2),
+            Point::new(f64::NEG_INFINITY, 3),
         ];
 
-        let encoded: Vec<(Vec<u8>, PointOffsetType)> = pairs
-            .iter()
-            .map(|k| (FloatPayloadType::encode_key(&k.key, k.idx), k.idx))
-            .collect();
-
-        let mut set_byte: BTreeMap<Vec<u8>, PointOffsetType> =
-            BTreeMap::from_iter(encoded.iter().cloned());
+        let mut set_byte: BTreeSet<Point<FloatPayloadType>> = pairs.iter().cloned().collect();
         let mut set_keys =
-            NumericKeySortedVec::<FloatPayloadType>::from_btree_map(set_byte.clone());
+            NumericKeySortedVec::<FloatPayloadType>::from_btree_set(set_byte.clone());
 
         check_ranges(&set_keys, &set_byte);
 
         // test deletion and ranges after deletion
-        let deleted_key = NumericIndexKey::new(0.4, 2);
-        set_keys.remove(deleted_key.clone());
-        set_byte.remove(&deleted_key.encode());
+        let deleted_key = Point::new(0.4, 2);
+        set_keys.remove(&deleted_key);
+        set_byte.remove(&deleted_key);
 
         check_ranges(&set_keys, &set_byte);
 
         // test deletion and ranges after deletion
-        let deleted_key = NumericIndexKey::new(-5.0, 1);
-        set_keys.remove(deleted_key.clone());
-        set_byte.remove(&deleted_key.encode());
+        let deleted_key = Point::new(-5.0, 1);
+        set_keys.remove(&deleted_key);
+        set_byte.remove(&deleted_key);
 
         check_ranges(&set_keys, &set_byte);
-    }
-
-    #[test]
-    fn test_numeric_index_key_sorting() {
-        let pairs = [
-            NumericIndexKey::new(0.0, 1),
-            NumericIndexKey::new(0.0, 3),
-            NumericIndexKey::new(-0.0, 2),
-            NumericIndexKey::new(-0.0, 4),
-            NumericIndexKey::new(0.4, 2),
-            NumericIndexKey::new(-0.4, 3),
-            NumericIndexKey::new(5.0, 1),
-            NumericIndexKey::new(-5.0, 1),
-            NumericIndexKey::new(f64::NAN, 0),
-            NumericIndexKey::new(f64::NAN, 2),
-            NumericIndexKey::new(f64::NAN, 3),
-            NumericIndexKey::new(f64::INFINITY, 0),
-            NumericIndexKey::new(f64::NEG_INFINITY, 1),
-            NumericIndexKey::new(f64::NEG_INFINITY, 2),
-            NumericIndexKey::new(f64::NEG_INFINITY, 3),
-        ];
-
-        let encoded: Vec<Vec<u8>> = pairs
-            .iter()
-            .map(|k| FloatPayloadType::encode_key(&k.key, k.idx))
-            .collect();
-
-        let set_byte: BTreeSet<Vec<u8>> = BTreeSet::from_iter(encoded.iter().cloned());
-        let set_keys: BTreeSet<NumericIndexKey<FloatPayloadType>> =
-            BTreeSet::from_iter(pairs.iter().cloned());
-
-        for (b, k) in set_byte.iter().zip(set_keys.iter()) {
-            let (decoded_id, decoded_float) = FloatPayloadType::decode_key(b.as_slice());
-            if decoded_float.is_nan() && k.key.is_nan() {
-                assert_eq!(decoded_id, k.idx);
-            } else {
-                assert_eq!(decoded_id, k.idx);
-                assert_eq!(decoded_float, k.key);
-            }
-        }
     }
 }

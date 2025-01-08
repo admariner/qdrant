@@ -1,22 +1,28 @@
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
+use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
-    PointInsertOperations, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+    WriteOrdering,
 };
+use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::shared_storage_config::SharedStorageConfig;
-use collection::operations::types::{NodeType, SearchRequest, VectorParams, VectorsConfig};
+use collection::operations::types::{NodeType, VectorsConfig};
+use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::cpu::CpuBudget;
 use segment::types::{Distance, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 
 use crate::common::{
-    dummy_on_replica_failure, dummy_request_shard_transfer, TEST_OPTIMIZERS_CONFIG,
+    dummy_abort_shard_transfer, dummy_on_replica_failure, dummy_request_shard_transfer, REST_PORT,
+    TEST_OPTIMIZERS_CONFIG,
 };
 
 async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
@@ -26,22 +32,18 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     };
 
     let collection_params = CollectionParams {
-        vectors: VectorsConfig::Single(VectorParams {
-            size: NonZeroU64::new(4).unwrap(),
-            distance: Distance::Dot,
-            hnsw_config: None,
-            quantization_config: None,
-            on_disk: None,
-        }),
+        vectors: VectorsConfig::Single(VectorParamsBuilder::new(4, Distance::Dot).build()),
         ..CollectionParams::empty()
     };
 
-    let config = CollectionConfig {
+    let config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: TEST_OPTIMIZERS_CONFIG.clone(),
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
+        strict_mode_config: Default::default(),
+        uuid: None,
     };
 
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
@@ -72,10 +74,13 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         &config,
         Arc::new(storage_config),
         shard_distribution,
-        ChannelService::default(),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
+        dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await
@@ -92,17 +97,17 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     // Upload 1000 random vectors to the collection
     let mut points = Vec::new();
     for i in 0..100 {
-        points.push(PointStruct {
+        points.push(PointStructPersisted {
             id: i.into(),
-            vector: vec![i as f32, 0.0, 0.0, 0.0].into(),
+            vector: VectorStructPersisted::Single(vec![i as f32, 0.0, 0.0, 0.0]),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
     let insert_points = CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-        PointInsertOperations::PointsList(points),
+        PointInsertOperationsInternal::PointsList(points),
     ));
     collection
-        .update_from_client(insert_points, true, WriteOrdering::default())
+        .update_from_client_simple(insert_points, true, WriteOrdering::default())
         .await
         .unwrap();
 
@@ -128,34 +133,51 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         recover_dir.path(),
         snapshots_path.path(),
         Default::default(),
-        ChannelService::default(),
+        ChannelService::new(REST_PORT, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
+        dummy_abort_shard_transfer(),
         None,
+        None,
+        CpuBudget::default(),
         None,
     )
     .await;
 
     let query_vector = vec![1.0, 0.0, 0.0, 0.0];
 
-    let full_search_request = SearchRequest {
+    let full_search_request = SearchRequestInternal {
         vector: query_vector.clone().into(),
         filter: None,
         limit: 100,
-        offset: 0,
+        offset: None,
         with_payload: Some(WithPayloadInterface::Bool(true)),
         with_vector: Some(WithVector::Bool(true)),
         params: None,
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let reference_result = collection
-        .search(full_search_request.clone(), None, None)
+        .search(
+            full_search_request.clone().into(),
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            hw_acc,
+        )
         .await
         .unwrap();
 
+    let hw_acc = HwMeasurementAcc::new();
     let recovered_result = recovered_collection
-        .search(full_search_request, None, None)
+        .search(
+            full_search_request.into(),
+            None,
+            &ShardSelectorInternal::All,
+            None,
+            hw_acc,
+        )
         .await
         .unwrap();
 

@@ -1,3 +1,8 @@
+# Enable GPU support.
+# This option can be set to `nvidia` or `amd` to enable GPU support.
+# This option is defined here because it is used in `FROM` instructions.
+ARG GPU
+
 # Cross-compiling using Docker multi-platform builds/images and `xx`.
 #
 # https://docs.docker.com/build/building/multi-platform/
@@ -7,7 +12,7 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} tonistiigi/xx AS xx
 # Utilizing Docker layer caching with `cargo-chef`.
 #
 # https://www.lpalmieri.com/posts/fast-rust-docker-builds/
-FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.72.1 AS chef
+FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.83.0 AS chef
 
 
 FROM chef AS planner
@@ -16,7 +21,7 @@ COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
 
-FROM chef as builder
+FROM chef AS builder
 WORKDIR /qdrant
 
 COPY --from=xx / /
@@ -40,7 +45,7 @@ RUN apt-get update \
 ARG BUILDPLATFORM
 ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
 
-ARG MOLD_VERSION=2.2.0
+ARG MOLD_VERSION=2.31.0
 
 RUN case "$BUILDPLATFORM" in \
         */amd64 ) PLATFORM=x86_64 ;; \
@@ -76,41 +81,110 @@ ARG RUSTFLAGS
 # Select linker (e.g., `mold`, `lld` or an empty string for the default linker)
 ARG LINKER=mold
 
+# Enable GPU support
+ARG GPU
+
 COPY --from=planner /qdrant/recipe.json recipe.json
-# `PKG_CONFIG=...` is a workaround for `xx-cargo` bug for crates based on `pkg-config`!
+# `PKG_CONFIG=...` is a workaround for `xx-cargo` bug for crates using `pkg-config`!
 #
 # https://github.com/tonistiigi/xx/issues/107
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
     RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
-    xx-cargo chef cook --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace --recipe-path recipe.json
+    xx-cargo chef cook --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --recipe-path recipe.json
 
 COPY . .
-# `PKG_CONFIG=...` is a workaround for `xx-cargo` bug for crates based on `pkg-config`!
+# Include git commit into Qdrant binary during build
+ARG GIT_COMMIT_ID
+# `PKG_CONFIG=...` is a workaround for `xx-cargo` bug for crates using `pkg-config`!
 #
 # https://github.com/tonistiigi/xx/issues/107
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
     RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
-    xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace --bin qdrant \
+    xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant \
     && PROFILE_DIR=$(if [ "$PROFILE" = dev ]; then echo debug; else echo $PROFILE; fi) \
     && mv target/$(xx-cargo --print-target-triple)/$PROFILE_DIR/qdrant /qdrant/qdrant
 
 # Download and extract web UI
-RUN mkdir /static ; STATIC_DIR='/static' ./tools/sync-web-ui.sh
+RUN mkdir /static && STATIC_DIR=/static ./tools/sync-web-ui.sh
 
 
-FROM debian:12-slim AS qdrant
+# Dockerfile does not support conditional `FROM` directly.
+# To workaround this limitation, we use a multi-stage build with a different base images which have equal name to ARG value.
 
-RUN apt-get update \
-    && apt-get install -y ca-certificates tzdata libunwind8 \
+# Base image for Qdrant.
+FROM debian:12-slim AS qdrant-cpu
+
+
+# Base images for Qdrant with nvidia GPU support.
+FROM nvidia/opengl:1.2-glvnd-devel-ubuntu22.04 AS qdrant-gpu-nvidia
+# Set non-interactive mode for apt-get.
+ENV DEBIAN_FRONTEND=noninteractive
+# Set NVIDIA driver capabilities. By default, all capabilities are disabled.
+ENV NVIDIA_DRIVER_CAPABILITIES compute,graphics,utility
+# Copy Nvidia ICD loader file into the container.
+COPY --from=builder /qdrant/lib/gpu/nvidia_icd.json /etc/vulkan/icd.d/
+# Override maintainer label. Nvidia base image have it's own maintainer label.
+LABEL maintainer "Qdrant Team <info@qdrant.tech>"
+
+
+# Base images for Qdrant with amd GPU support.
+FROM rocm/dev-ubuntu-22.04 AS qdrant-gpu-amd
+# Set non-interactive mode for apt-get.
+ENV DEBIAN_FRONTEND=noninteractive
+# Override maintainer label. AMD base image have it's own maintainer label.
+LABEL maintainer "Qdrant Team <info@qdrant.tech>"
+
+
+FROM qdrant-${GPU:+gpu-}${GPU:-cpu} AS qdrant
+
+RUN apt-get update
+
+# Install GPU dependencies
+ARG GPU
+
+RUN if [ -n "$GPU" ]; then \
+    apt-get install -y \
+    libvulkan1 \
+    libvulkan-dev \
+    vulkan-tools \
+    ; fi
+
+# Install additional packages into the container.
+# E.g., the debugger of choice: gdb/gdbserver/lldb.
+ARG PACKAGES
+
+RUN apt-get install -y --no-install-recommends ca-certificates tzdata libunwind8 $PACKAGES \
     && rm -rf /var/lib/apt/lists/*
 
-ARG APP=/qdrant
+# Copy Qdrant source files into the container. Useful for debugging.
+#
+# To enable, set `SOURCES` to *any* non-empty string. E.g., 1/true/enable/whatever.
+# (Note, that *any* non-empty string would work, so 0/false/disable would enable the option as well.)
+ARG SOURCES
 
-RUN mkdir -p "$APP"
+# Dockerfile does not support conditional `COPY` instructions (e.g., it's impossible to do something
+# like `if [ -n "$SOURCES" ]; then COPY ...; fi`), so we *hack* conditional `COPY` by abusing
+# parameter expansion and `COPY` wildcards support. 😎
+
+ENV DIR=${SOURCES:+/qdrant/src}
+COPY --from=builder ${DIR:-/null?} $DIR/
+
+ENV DIR=${SOURCES:+/qdrant/lib}
+COPY --from=builder ${DIR:-/null?} $DIR/
+
+ENV DIR=${SOURCES:+/usr/local/cargo/registry/src}
+COPY --from=builder ${DIR:-/null?} $DIR/
+
+ENV DIR=${SOURCES:+/usr/local/cargo/git/checkouts}
+COPY --from=builder ${DIR:-/null?} $DIR/
+
+ENV DIR=
+
+ARG APP=/qdrant
 
 COPY --from=builder /qdrant/qdrant "$APP"/qdrant
 COPY --from=builder /qdrant/config "$APP"/config
@@ -124,6 +198,7 @@ ARG USER_ID=0
 RUN if [ "$USER_ID" != 0 ]; then \
         groupadd --gid "$USER_ID" qdrant; \
         useradd --uid "$USER_ID" --gid "$USER_ID" -m qdrant; \
+        mkdir -p "$APP"/storage "$APP"/snapshots; \
         chown -R "$USER_ID:$USER_ID" "$APP"; \
     fi
 

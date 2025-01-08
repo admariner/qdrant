@@ -1,8 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::fmt::Display;
 use std::future::Future;
 use std::ops::Deref;
+use std::str;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,11 +11,13 @@ use anyhow::{anyhow, Context};
 use chrono::Utc;
 use collection::collection_state;
 use collection::common::is_ready::IsReady;
+use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
 use collection::shards::CollectionId;
+use common::defaults;
 use futures::future::join_all;
 use parking_lot::{Mutex, RwLock};
-use raft::eraftpb::{ConfChangeType, ConfChangeV2, Entry as RaftEntry};
+use raft::eraftpb::{ConfChange, ConfChangeType, ConfChangeV2, Entry as RaftEntry, EntryType};
 use raft::{GetEntriesContext, RaftState, RawNode, SoftState, Storage};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -32,10 +35,8 @@ use crate::content_manager::consensus::operation_sender::OperationSender;
 use crate::content_manager::consensus::persistent::Persistent;
 use crate::types::{
     ClusterInfo, ClusterStatus, ConsensusThreadStatus, MessageSendErrors, PeerAddressById,
-    PeerInfo, RaftInfo,
+    PeerInfo, PeerMetadataById, RaftInfo,
 };
-
-pub const DEFAULT_META_OP_WAIT: Duration = Duration::from_secs(10);
 
 pub mod prelude {
     use crate::content_manager::toc::TableOfContent;
@@ -43,11 +44,16 @@ pub mod prelude {
     pub type ConsensusState = super::ConsensusManager<TableOfContent>;
 }
 
+/// Allow us updating our peer metadata once every 60 seconds
+const CONSENSUS_PEER_METADATA_UPDATE_INTERVAL: Duration = Duration::from_secs(60);
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SnapshotData {
     pub collections_data: CollectionsSnapshot,
     #[serde(with = "crate::serialize_peer_addresses")]
     pub address_by_id: PeerAddressById,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub metadata_by_id: PeerMetadataById,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
@@ -86,13 +92,12 @@ pub struct ConsensusManager<C: CollectionContainer> {
     /// Sends messages to the consensus thread, which is defined externally, outside of the state.
     /// (e.g. in the `src/consensus.rs`)
     propose_sender: OperationSender,
-    /// Defines if this peer is a first peer of the consensus,
-    /// which might affect the init logic
-    first_voter: RwLock<Option<PeerId>>,
     /// Status of the consensus thread, changed by the consensus thread
     consensus_thread_status: RwLock<ConsensusThreadStatus>,
     /// Consensus thread errors, changed by the consensus thread
     message_send_failures: RwLock<HashMap<String, MessageSendErrors>>,
+    /// Last time we attempted to update the peer metadata
+    next_peer_metadata_update_attempt: Mutex<Instant>,
 }
 
 impl<C: CollectionContainer> ConsensusManager<C> {
@@ -110,11 +115,11 @@ impl<C: CollectionContainer> ConsensusManager<C> {
             toc,
             on_consensus_op_apply: Default::default(),
             propose_sender,
-            first_voter: Default::default(),
             consensus_thread_status: RwLock::new(ConsensusThreadStatus::Working {
                 last_update: Utc::now(),
             }),
             message_send_failures: Default::default(),
+            next_peer_metadata_update_attempt: Mutex::new(Instant::now()),
         }
     }
 
@@ -143,6 +148,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         }
         entry.count += 1;
         entry.latest_error = Some(error.to_string());
+        entry.latest_error_timestamp = Some(Utc::now());
     }
 
     pub fn record_message_send_success(&self, peer_address: &Uri) {
@@ -175,15 +181,42 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         self.persistent.read().this_peer_id
     }
 
+    pub fn peers(&self) -> Vec<PeerId> {
+        self.persistent
+            .read()
+            .peer_address_by_id()
+            .keys()
+            .copied()
+            .collect()
+    }
+
     pub fn first_voter(&self) -> PeerId {
-        match self.first_voter.read().as_ref() {
-            Some(id) => *id,
-            None => self.this_peer_id(),
+        let state = self.persistent.read();
+
+        match state.first_voter() {
+            Some(peer_id) if peer_id != PeerId::MAX => peer_id,
+            _ => state.this_peer_id(),
         }
     }
 
-    pub fn set_first_voter(&self, id: PeerId) {
-        *self.first_voter.write() = Some(id);
+    pub fn set_first_voter(&self, id: PeerId) -> Result<(), StorageError> {
+        self.persistent.write().set_first_voter(id)
+    }
+
+    pub fn recover_first_voter(&self) -> Result<(), StorageError> {
+        if self.persistent.read().first_voter().is_none() {
+            log::debug!("Recovering first voter peer...");
+
+            let wal = self.wal.lock();
+            let peers = self.peers();
+
+            if let Some(peer_id) = recover_first_voter(&wal, &peers)? {
+                log::debug!("Recovered first voter peer {peer_id}");
+                self.set_first_voter(peer_id)?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Report aggregated information about the cluster.
@@ -284,9 +317,8 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
         loop {
             let unapplied_index = self.persistent.read().current_unapplied_entry();
-            let entry_index = match unapplied_index {
-                Some(index) => index,
-                None => break,
+            let Some(entry_index) = unapplied_index else {
+                break;
             };
             log::debug!("Applying committed entry with index {entry_index}");
             let entry = self
@@ -331,7 +363,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                         );
                         stop_consensus
                     }
-                    ty => {
+                    ty @ EntryType::EntryConfChange => {
                         return Err(anyhow!("Unexpected entry type: {:?}", ty));
                     }
                 }
@@ -357,7 +389,7 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         entry: &RaftEntry,
         raw_node: &mut RawNode<T>,
     ) -> Result<bool, StorageError> {
-        let change: ConfChangeV2 = prost::Message::decode(entry.get_data())?;
+        let change: ConfChangeV2 = prost_for_raft::Message::decode(entry.get_data())?;
 
         let conf_state = raw_node.apply_conf_change(&change)?;
         log::debug!("Applied conf state {:?}", conf_state);
@@ -369,12 +401,30 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         for single_change in &change.changes {
             match single_change.change_type() {
                 ConfChangeType::AddNode => {
-                    debug_assert!(
-                        self.peer_address_by_id()
-                            .get(&single_change.node_id)
-                            .is_some(),
-                        "Peer should be already known"
-                    )
+                    let context = entry.get_context();
+
+                    if !context.is_empty() {
+                        let peer_uri = str::from_utf8(context)
+                            .map_err(|err| {
+                                StorageError::service_error(format!(
+                                    "failed to parse peer URI: {err}"
+                                ))
+                            })?
+                            .parse()
+                            .map_err(|err| {
+                                StorageError::service_error(format!(
+                                    "failed to parse peer URI: {err}"
+                                ))
+                            })?;
+
+                        self.add_peer(single_change.node_id, peer_uri)?;
+                    } else {
+                        debug_assert!(
+                            self.peer_address_by_id()
+                                .contains_key(&single_change.node_id),
+                            "Peer should be already known"
+                        )
+                    }
                 }
                 ConfChangeType::RemoveNode => {
                     log::debug!("Removing node {}", single_change.node_id);
@@ -449,6 +499,20 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                 Ok(false)
             }
 
+            ConsensusOperations::UpdatePeerMetadata { peer_id, metadata } => {
+                self.persistent
+                    .write()
+                    .update_peer_metadata(peer_id, metadata)?;
+                Ok(true)
+            }
+
+            ConsensusOperations::UpdateClusterMetadata { key, value } => {
+                self.persistent
+                    .write()
+                    .update_cluster_metadata_key(key, value);
+                Ok(true)
+            }
+
             ConsensusOperations::RequestSnapshot | ConsensusOperations::ReportSnapshot { .. } => {
                 unreachable!()
             }
@@ -472,9 +536,11 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         let data: SnapshotData = snapshot.get_data().try_into()?;
         self.toc.apply_collections_snapshot(data.collections_data)?;
         self.wal.lock().clear()?;
-        self.persistent
-            .write()
-            .update_from_snapshot(meta, data.address_by_id)?;
+        self.persistent.write().update_from_snapshot(
+            meta,
+            data.address_by_id,
+            data.metadata_by_id,
+        )?;
 
         Ok(Ok(()))
     }
@@ -524,23 +590,23 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     }
 
     async fn await_receiver(
+        &self,
         mut receiver: Receiver<Result<bool, StorageError>>,
         wait_timeout: Duration,
+        operation: &ConsensusOperations,
     ) -> Result<bool, StorageError> {
         let timeout_res = tokio::time::timeout(wait_timeout, receiver.recv())
             .await
             .map_err(|_: Elapsed| {
+                self.on_consensus_op_apply.lock().remove(operation);
                 StorageError::service_error(format!(
                     "Waiting for consensus operation commit failed. Timeout set at: {} seconds",
-                    wait_timeout.as_secs_f64()
+                    wait_timeout.as_secs_f64(),
                 ))
             })?;
         // 2 possible errors to forward: channel sender dropped OR operation failed
         timeout_res.map_err(|err| {
-            StorageError::service_error(format!(
-                "Error occurred while waiting for consensus operation. Channel sender dropped ({})",
-                err
-            ))
+            StorageError::service_error(format!("Error occurred while waiting for consensus operation. Channel sender dropped ({err})"))
         })?
     }
 
@@ -570,9 +636,11 @@ impl<C: CollectionContainer> ConsensusManager<C> {
 
         async move {
             let await_for_all = join_all(receivers.iter_mut().map(|receiver| receiver.recv()));
-            let results =
-                tokio::time::timeout(wait_timeout.unwrap_or(DEFAULT_META_OP_WAIT), await_for_all)
-                    .await?;
+            let results = tokio::time::timeout(
+                wait_timeout.unwrap_or(defaults::CONSENSUS_META_OP_WAIT),
+                await_for_all,
+            )
+            .await?;
             for result in results {
                 match result {
                     Ok(response_res) => match response_res {
@@ -586,42 +654,41 @@ impl<C: CollectionContainer> ConsensusManager<C> {
         }
     }
 
-    /// Wait and block until consensus reaches a `commit` and `term`
+    /// Wait and block until consensus reaches a `term` and actually applies the `commit`.
     ///
-    /// # Returns
+    /// # Errors
     ///
-    /// Returns `true` if successful.
-    /// Returns `false` on failure, if we have diverged commit/term for example.
+    /// Returns an error if we have diverged commit/term for example.
     pub async fn wait_for_consensus_commit(
         &self,
         commit: u64,
         term: u64,
         consensus_tick: Duration,
         timeout: Duration,
-    ) -> bool {
+    ) -> Result<(), ()> {
         let start = Instant::now();
 
         // TODO: naive approach with spinlock for waiting on commit/term, find better way
         while start.elapsed() < timeout {
-            let state = &self.hard_state();
+            let (current_commit, current_term) = self.persistent.read().applied_commit_term();
 
             // Okay if on the same term and have at least the specified commit
-            let is_ok = state.term == term && state.commit >= commit;
+            let is_ok = current_term == term && current_commit >= commit;
             if is_ok {
-                return true;
+                return Ok(());
             }
 
-            // Fail if on a different term
-            let is_fail = state.term != term;
+            // Fail if on a newer term
+            let is_fail = current_term > term;
             if is_fail {
-                return false;
+                return Err(());
             }
 
             tokio::time::sleep(consensus_tick).await
         }
 
         // Fail on timeout
-        false
+        Err(())
     }
 
     /// Send operation to the consensus thread and listen for the result.
@@ -630,16 +697,12 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     ///
     /// * `operation` - operation to propose
     /// * `wait_timeout` - How long do we need to wait for the confirmation
-    /// * `with_confirmation` - If `true` - additional empty operation will be sent to the consensus thread.
-    ///   This is needed to ensure that the operation is committed and applied on majority of the nodes.
-    ///   We can not wait for all nodes confirmation, because it is not guaranteed that all nodes will be online.
-    ///
     pub async fn propose_consensus_op_with_await(
         &self,
         operation: ConsensusOperations,
         wait_timeout: Option<Duration>,
     ) -> Result<bool, StorageError> {
-        let wait_timeout = wait_timeout.unwrap_or(DEFAULT_META_OP_WAIT);
+        let wait_timeout = wait_timeout.unwrap_or(defaults::CONSENSUS_META_OP_WAIT);
 
         let is_leader_established = self.is_leader_established.clone();
 
@@ -673,12 +736,14 @@ impl<C: CollectionContainer> ConsensusManager<C> {
                     // propose operation to consensus thread
                     self.propose_sender.send(operation.clone())?;
                     // insert new sender
-                    on_apply_lock.insert(operation, sender);
+                    on_apply_lock.insert(operation.clone(), sender);
                 }
             };
         }
 
-        let res = Self::await_receiver(receiver, wait_timeout).await?;
+        let res = self
+            .await_receiver(receiver, wait_timeout, &operation)
+            .await?;
         Ok(res)
     }
 
@@ -699,8 +764,147 @@ impl<C: CollectionContainer> ConsensusManager<C> {
     }
 
     pub fn sync_local_state(&self) -> Result<(), StorageError> {
+        self.try_update_peer_metadata();
         self.toc.sync_local_state()
     }
+
+    pub fn clear_wal(&self) -> Result<(), StorageError> {
+        self.wal.lock().clear()
+    }
+
+    pub fn compact_wal(&self, min_entries_to_compact: u64) -> Result<bool, StorageError> {
+        if min_entries_to_compact == 0 {
+            return Ok(false);
+        }
+
+        let Some(first_entry) = self.wal.lock().first_entry()? else {
+            return Ok(false);
+        };
+
+        let Some(applied_index) = self.persistent.read().last_applied_entry() else {
+            return Ok(false);
+        };
+
+        let first_unapplied_index = applied_index + 1;
+
+        // ToDo: it seems like a mistake, need to check if it's correct
+        // debug_assert!(first_unapplied_index <= first_entry.index);
+
+        if first_unapplied_index - first_entry.index < min_entries_to_compact {
+            return Ok(false);
+        }
+
+        self.wal.lock().compact(first_unapplied_index)?;
+        Ok(true)
+    }
+
+    /// Try to update our peer metadata if it's outdated
+    ///
+    /// It rate limits updating to `CONSENSUS_PEER_METADATA_UPDATE_INTERVAL`.
+    fn try_update_peer_metadata(&self) {
+        // Throttle updates to prevent spamming consensus
+        if Instant::now() < *self.next_peer_metadata_update_attempt.lock() {
+            return;
+        }
+
+        if !self.persistent.read().is_our_metadata_outdated() {
+            return;
+        }
+
+        log::debug!("Proposing consensus peer metadata update for this peer");
+        let result = self
+            .propose_sender
+            .send(ConsensusOperations::UpdatePeerMetadata {
+                peer_id: self.this_peer_id(),
+                metadata: PeerMetadata::current(),
+            });
+        if let Err(err) = result {
+            log::error!("Failed to propose consensus peer metadata update for this peer: {err}");
+        }
+        *self.next_peer_metadata_update_attempt.lock() =
+            Instant::now() + CONSENSUS_PEER_METADATA_UPDATE_INTERVAL;
+    }
+}
+
+fn recover_first_voter(
+    wal: &ConsensusOpWal,
+    peers: &[PeerId],
+) -> Result<Option<PeerId>, StorageError> {
+    let Some(first_entry) = wal.first_entry()? else {
+        log::debug!("Skipped recovering first voter peer: WAL is empty");
+        return Ok(None);
+    };
+
+    let Some(last_entry) = wal.last_entry()? else {
+        log::error!(
+            "Failed to recover first voter peer: \
+             WAL contains first entry, but no last entry"
+        );
+
+        return Ok(None);
+    };
+
+    if first_entry.index != 1 {
+        log::warn!("Failed to recover first voter peer: WAL is truncated");
+        return Ok(Some(PeerId::MAX));
+    }
+
+    // Try to recover first voter peer from WAL (if it was not removed from cluster yet!):
+    // - collect a list of current peers
+    // - scroll WAL and *remove* a peer from the list when `AddPeer`/`AddLearnerPeer` operation encountered
+    // - if there's exactly one peer left in the list at the end, this peer should be the first voter
+
+    let mut peers: HashSet<_> = peers.iter().copied().collect();
+
+    for index in first_entry.index..last_entry.index + 1 {
+        let entry = wal.entry(index)?;
+
+        match entry.get_entry_type() {
+            EntryType::EntryConfChangeV2 => {
+                let change: ConfChangeV2 = prost_for_raft::Message::decode(entry.get_data())?;
+
+                for change in change.changes {
+                    match change.get_change_type() {
+                        ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
+                            peers.remove(&change.get_node_id());
+                        }
+
+                        ConfChangeType::RemoveNode => (),
+                    }
+                }
+            }
+
+            EntryType::EntryConfChange => {
+                log::warn!(
+                    "Encountered deprecated ConfChange message while recovering first voter peer"
+                );
+
+                let change: ConfChange = prost_for_raft::Message::decode(entry.get_data())?;
+
+                match change.get_change_type() {
+                    ConfChangeType::AddNode | ConfChangeType::AddLearnerNode => {
+                        peers.remove(&change.get_node_id());
+                    }
+
+                    ConfChangeType::RemoveNode => (),
+                }
+            }
+
+            EntryType::EntryNormal => continue,
+        }
+    }
+
+    if peers.len() > 1 {
+        log::warn!(
+            "Failed to recover first voter peer: \
+             found multiple peers without ConfChange entry in WAL: \
+             {peers:?}"
+        );
+
+        return Ok(Some(PeerId::MAX));
+    }
+
+    Ok(peers.into_iter().next())
 }
 
 /// Implementation of the methods for Raft library to get information from
@@ -719,9 +923,18 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
         _context: GetEntriesContext,
     ) -> raft::Result<Vec<RaftEntry>> {
         let max_size: Option<_> = max_size.into();
-        if low < self.first_index()? {
+        let first_index = self.first_index()?;
+        if low < first_index {
+            log::debug!(
+                "Requested entries from {} to {} are already compacted (first index: {})",
+                low,
+                high,
+                first_index
+            );
             return Err(raft::Error::Store(raft::StorageError::Compacted));
         }
+
+        log::debug!("Requesting entries from {} to {}", low, high);
 
         if high > self.last_index()? + 1 {
             panic!(
@@ -761,26 +974,51 @@ impl<C: CollectionContainer> Storage for ConsensusManager<C> {
 
     fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<raft::eraftpb::Snapshot> {
         let collections_data = self.toc.collections_snapshot();
+
+        // TODO: Should we lock `persistent` *before* calling `TableOfContent::collections_snapshot`!?
         let persistent = self.persistent.read();
-        let raft_state = persistent.state().clone();
-        if raft_state.hard_state.commit >= request_index {
-            let snapshot = SnapshotData {
-                collections_data,
-                address_by_id: persistent.peer_address_by_id(),
-            };
-            Ok(raft::eraftpb::Snapshot {
-                data: serde_cbor::to_vec(&snapshot).map_err(raft_error_other)?,
-                metadata: Some(raft::eraftpb::SnapshotMetadata {
-                    conf_state: Some(raft_state.conf_state),
-                    index: raft_state.hard_state.commit,
-                    term: raft_state.hard_state.term,
-                }),
-            })
-        } else {
-            Err(raft::Error::Store(
+
+        if persistent.state.hard_state.commit < request_index {
+            // TODO: `raft::storage::MemStorage::snapshot` does `snapshot.mut_metadata().index = request_index` in this case... 🤔
+            return Err(raft::Error::Store(
                 raft::StorageError::SnapshotTemporarilyUnavailable,
-            ))
+            ));
         }
+
+        let data = SnapshotData {
+            collections_data,
+            address_by_id: persistent.peer_address_by_id(),
+            metadata_by_id: persistent.peer_metadata_by_id(),
+        };
+
+        let raft_state = persistent.state();
+
+        // Index of snapshot is the current *commit* index.
+        let index = raft_state.hard_state.commit;
+
+        // Term of snapshot is the term of the entry at current commit index. Not the current term!
+        //
+        // Last committed entry should either be available in the WAL, or, if current node applied
+        // Raft snapshot (and so completely compacted the WAL) and no new entries were committed yet,
+        // it should be the term of `latest_snapshot_meta`.
+        let term = if index == persistent.latest_snapshot_meta.index {
+            persistent.latest_snapshot_meta.term
+        } else {
+            self.wal.lock().entry(index)?.term
+        };
+
+        let meta = raft::eraftpb::SnapshotMetadata {
+            conf_state: Some(raft_state.conf_state.clone()),
+            index,
+            term,
+        };
+
+        let snapshot = raft::eraftpb::Snapshot {
+            data: serde_cbor::to_vec(&data).map_err(raft_error_other)?,
+            metadata: Some(meta),
+        };
+
+        Ok(snapshot)
     }
 }
 
@@ -847,7 +1085,9 @@ mod tests {
 
     use collection::shards::shard::PeerId;
     use proptest::prelude::*;
-    use raft::eraftpb::Entry;
+    use raft::eraftpb::{
+        ConfChange, ConfChangeSingle, ConfChangeType, ConfChangeV2, Entry, EntryType,
+    };
     use raft::storage::{MemStorage, Storage};
     use tempfile::Builder;
 
@@ -861,7 +1101,7 @@ mod tests {
     #[test]
     fn update_is_applied() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut state = Persistent::load_or_init(dir.path(), false).unwrap();
+        let mut state = Persistent::load_or_init(dir.path(), false, false).unwrap();
         assert_eq!(state.state().hard_state.commit, 0);
         state
             .apply_state_update(|state| state.hard_state.commit = 1)
@@ -883,13 +1123,13 @@ mod tests {
     #[test]
     fn state_is_loaded() {
         let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
-        let mut state = Persistent::load_or_init(dir.path(), false).unwrap();
+        let mut state = Persistent::load_or_init(dir.path(), false, false).unwrap();
         state
             .apply_state_update(|state| state.hard_state.commit = 1)
             .unwrap();
         assert_eq!(state.state().hard_state.commit, 1);
 
-        let state_loaded = Persistent::load_or_init(dir.path(), false).unwrap();
+        let state_loaded = Persistent::load_or_init(dir.path(), false, false).unwrap();
         assert_eq!(state_loaded.state().hard_state.commit, 1);
     }
 
@@ -987,7 +1227,7 @@ mod tests {
         entries: Vec<Entry>,
         path: &std::path::Path,
     ) -> (ConsensusManager<NoCollections>, MemStorage) {
-        let persistent = Persistent::load_or_init(path, true).unwrap();
+        let persistent = Persistent::load_or_init(path, true, false).unwrap();
         let (sender, _) = mpsc::channel();
         let consensus_state = ConsensusManager::new(
             persistent,
@@ -1043,6 +1283,119 @@ mod tests {
             let context_1 = raft::storage::GetEntriesContext::empty(false);
             let context_2 = raft::storage::GetEntriesContext::empty(false);
             prop_assert_eq!(mem_storage.entries(low, high, max_size, context_1), consensus_state.entries(low, high, max_size, context_2));
+        }
+    }
+
+    #[test]
+    fn recover_first_voter() {
+        let (_dir, wal) = wal(0);
+        let peers = vec![1337, 42, 69];
+        assert_eq!(
+            super::recover_first_voter(&wal, &peers).unwrap(),
+            Some(1337)
+        );
+    }
+
+    #[test]
+    fn recover_first_voter_empty() {
+        let (_dir, wal) = empty_wal();
+        let peers = vec![1337, 42, 69];
+        assert_eq!(super::recover_first_voter(&wal, &peers).unwrap(), None);
+    }
+
+    #[test]
+    fn recover_first_voter_committed() {
+        let (_dir, wal) = wal(1);
+        let peers = vec![1337, 42, 69];
+        assert_eq!(super::recover_first_voter(&wal, &peers).unwrap(), None);
+    }
+
+    #[test]
+    fn recover_first_voter_truncated() {
+        let (_dir, wal) = wal(2);
+        let peers = vec![1337, 42, 69];
+        assert_eq!(
+            super::recover_first_voter(&wal, &peers).unwrap(),
+            Some(PeerId::MAX)
+        );
+    }
+
+    #[test]
+    fn recover_first_voter_multiple_peers() {
+        let (_dir, wal) = wal(0);
+        let peers = vec![1337, 42, 69, 228];
+        assert_eq!(
+            super::recover_first_voter(&wal, &peers).unwrap(),
+            Some(PeerId::MAX)
+        );
+    }
+
+    fn wal(first_index: u64) -> (tempfile::TempDir, ConsensusOpWal) {
+        let (dir, mut wal) = empty_wal();
+        wal.append_entries(entries(first_index)).unwrap();
+        (dir, wal)
+    }
+
+    fn empty_wal() -> (tempfile::TempDir, ConsensusOpWal) {
+        let dir = Builder::new().prefix("raft_state_test").tempdir().unwrap();
+        let wal = ConsensusOpWal::new(dir.path().to_str().unwrap());
+        (dir, wal)
+    }
+
+    fn entries(first_index: u64) -> Vec<Entry> {
+        use ConfChangeType::*;
+
+        let mut entries = vec![
+            conf_change_v2(first_index, &[(AddNode, 1337)]),
+            conf_change_v2(
+                first_index + 1,
+                &[(AddLearnerNode, 42), (AddLearnerNode, 69)],
+            ),
+            conf_change_v2(first_index + 2, &[(AddNode, 42)]),
+            conf_change(first_index + 3, RemoveNode, 228),
+            conf_change(first_index + 4, AddLearnerNode, 666),
+            conf_change_v2(first_index + 5, &[(AddNode, 69)]),
+            conf_change(first_index + 6, AddNode, 666),
+        ];
+
+        // Remove first entry if `first_index` is 0, so that second entry would line up with index 1
+        if first_index == 0 {
+            entries.remove(0);
+        }
+
+        entries
+    }
+
+    fn conf_change_v2(index: u64, changes: &[(ConfChangeType, PeerId)]) -> Entry {
+        let mut conf_change = ConfChangeV2::default();
+
+        for &(change_type, node_id) in changes {
+            conf_change.changes.push(ConfChangeSingle {
+                change_type: change_type as _,
+                node_id,
+            });
+        }
+
+        Entry {
+            index,
+            entry_type: EntryType::EntryConfChangeV2 as _,
+            data: prost_for_raft::Message::encode_to_vec(&conf_change),
+            ..Default::default()
+        }
+    }
+
+    fn conf_change(index: u64, change_type: ConfChangeType, node_id: PeerId) -> Entry {
+        let conf_change = ConfChange {
+            change_type: change_type as _,
+            node_id,
+            ..Default::default()
+        };
+
+        Entry {
+            index,
+            entry_type: EntryType::EntryConfChange as _,
+            data: prost_for_raft::Message::encode_to_vec(&conf_change),
+            ..Default::default()
         }
     }
 }

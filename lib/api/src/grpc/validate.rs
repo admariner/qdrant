@@ -1,10 +1,13 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use common::validation::validate_range_generic;
+use common::validation::{validate_range_generic, validate_shard_different_peers};
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use super::qdrant::{GeoLineString, NamedVectors};
+use super::qdrant as grpc;
+
+const TIMESTAMP_MIN_SECONDS: i64 = -62_135_596_800; // 0001-01-01T00:00:00Z
+const TIMESTAMP_MAX_SECONDS: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z
 
 pub trait ValidateExt {
     fn validate(&self) -> Result<(), ValidationErrors>;
@@ -37,45 +40,22 @@ where
     }
 }
 
-impl<V> ValidateExt for Vec<V>
-where
-    V: Validate,
-{
-    #[inline]
-    #[allow(clippy::manual_try_fold)] // `try_fold` can't be used because it shortcuts on Err
-    fn validate(&self) -> Result<(), ValidationErrors> {
-        let errors = self
-            .iter()
-            .filter_map(|v| v.validate().err())
-            .fold(Err(ValidationErrors::new()), |bag, err| {
-                ValidationErrors::merge(bag, "?", Err(err))
-            })
-            .unwrap_err();
-        errors.errors().is_empty().then_some(()).ok_or(errors)
-    }
-}
-
 impl<K, V> ValidateExt for HashMap<K, V>
 where
     V: Validate,
 {
     #[inline]
-    #[allow(clippy::manual_try_fold)] // `try_fold` can't be used because it shortcuts on Err
     fn validate(&self) -> Result<(), ValidationErrors> {
-        let errors = self
-            .values()
-            .filter_map(|v| v.validate().err())
-            .fold(Err(ValidationErrors::new()), |bag, err| {
-                ValidationErrors::merge(bag, "?", Err(err))
-            })
-            .unwrap_err();
-        errors.errors().is_empty().then_some(()).ok_or(errors)
+        match self.values().find_map(|v| v.validate().err()) {
+            Some(err) => ValidationErrors::merge(Err(Default::default()), "[]", Err(err)),
+            None => Ok(()),
+        }
     }
 }
 
-impl Validate for crate::grpc::qdrant::vectors_config::Config {
+impl Validate for grpc::vectors_config::Config {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        use crate::grpc::qdrant::vectors_config::Config;
+        use grpc::vectors_config::Config;
         match self {
             Config::Params(params) => params.validate(),
             Config::ParamsMap(params_map) => params_map.validate(),
@@ -83,9 +63,9 @@ impl Validate for crate::grpc::qdrant::vectors_config::Config {
     }
 }
 
-impl Validate for crate::grpc::qdrant::vectors_config_diff::Config {
+impl Validate for grpc::vectors_config_diff::Config {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        use crate::grpc::qdrant::vectors_config_diff::Config;
+        use grpc::vectors_config_diff::Config;
         match self {
             Config::Params(params) => params.validate(),
             Config::ParamsMap(params_map) => params_map.validate(),
@@ -93,9 +73,9 @@ impl Validate for crate::grpc::qdrant::vectors_config_diff::Config {
     }
 }
 
-impl Validate for crate::grpc::qdrant::quantization_config::Quantization {
+impl Validate for grpc::quantization_config::Quantization {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        use crate::grpc::qdrant::quantization_config::Quantization;
+        use grpc::quantization_config::Quantization;
         match self {
             Quantization::Scalar(scalar) => scalar.validate(),
             Quantization::Product(product) => product.validate(),
@@ -104,9 +84,9 @@ impl Validate for crate::grpc::qdrant::quantization_config::Quantization {
     }
 }
 
-impl Validate for crate::grpc::qdrant::quantization_config_diff::Quantization {
+impl Validate for grpc::quantization_config_diff::Quantization {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        use crate::grpc::qdrant::quantization_config_diff::Quantization;
+        use grpc::quantization_config_diff::Quantization;
         match self {
             Quantization::Scalar(scalar) => scalar.validate(),
             Quantization::Product(product) => product.validate(),
@@ -116,9 +96,93 @@ impl Validate for crate::grpc::qdrant::quantization_config_diff::Quantization {
     }
 }
 
-impl Validate for crate::grpc::qdrant::condition::ConditionOneOf {
+impl Validate for grpc::update_collection_cluster_setup_request::Operation {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        use crate::grpc::qdrant::condition::ConditionOneOf;
+        use grpc::update_collection_cluster_setup_request::Operation;
+        match self {
+            Operation::MoveShard(op) => op.validate(),
+            Operation::ReplicateShard(op) => op.validate(),
+            Operation::AbortTransfer(op) => op.validate(),
+            Operation::DropReplica(op) => op.validate(),
+            Operation::CreateShardKey(op) => op.validate(),
+            Operation::DeleteShardKey(op) => op.validate(),
+            Operation::RestartTransfer(op) => op.validate(),
+        }
+    }
+}
+
+impl Validate for grpc::MoveShard {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
+    }
+}
+
+impl Validate for grpc::ReplicateShard {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
+    }
+}
+
+impl Validate for crate::grpc::qdrant::AbortShardTransfer {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
+    }
+}
+
+impl Validate for grpc::CreateShardKey {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        if self.replication_factor == Some(0) {
+            let mut errors = ValidationErrors::new();
+            errors.add(
+                "replication_factor",
+                ValidationError::new("Replication factor must be greater than 0"),
+            );
+            return Err(errors);
+        }
+
+        if self.shards_number == Some(0) {
+            let mut errors = ValidationErrors::new();
+            errors.add(
+                "shards_number",
+                ValidationError::new("Shards number must be greater than 0"),
+            );
+            return Err(errors);
+        }
+
+        Ok(())
+    }
+}
+
+impl Validate for grpc::DeleteShardKey {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
+impl Validate for grpc::RestartTransfer {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        Ok(())
+    }
+}
+
+impl Validate for grpc::condition::ConditionOneOf {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        use grpc::condition::ConditionOneOf;
         match self {
             ConditionOneOf::Field(field_condition) => field_condition.validate(),
             ConditionOneOf::Nested(nested) => nested.validate(),
@@ -126,18 +190,31 @@ impl Validate for crate::grpc::qdrant::condition::ConditionOneOf {
             ConditionOneOf::IsEmpty(_) => Ok(()),
             ConditionOneOf::HasId(_) => Ok(()),
             ConditionOneOf::IsNull(_) => Ok(()),
+            ConditionOneOf::HasVector(_) => Ok(()),
         }
     }
 }
 
-impl Validate for crate::grpc::qdrant::FieldCondition {
+impl Validate for grpc::FieldCondition {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        let all_fields_none = self.r#match.is_none()
-            && self.range.is_none()
-            && self.geo_bounding_box.is_none()
-            && self.geo_radius.is_none()
-            && self.geo_polygon.is_none()
-            && self.values_count.is_none();
+        let grpc::FieldCondition {
+            key: _,
+            r#match,
+            range,
+            datetime_range,
+            geo_bounding_box,
+            geo_radius,
+            geo_polygon,
+            values_count,
+        } = self;
+
+        let all_fields_none = r#match.is_none()
+            && range.is_none()
+            && datetime_range.is_none()
+            && geo_bounding_box.is_none()
+            && geo_radius.is_none()
+            && geo_polygon.is_none()
+            && values_count.is_none();
 
         if all_fields_none {
             let mut errors = ValidationErrors::new();
@@ -152,68 +229,51 @@ impl Validate for crate::grpc::qdrant::FieldCondition {
     }
 }
 
-/// Validate the value is in `[1, ]` or `None`.
-pub fn validate_u64_range_min_1(value: &Option<u64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(1), None))
-}
-
-/// Validate the value is in `[1, ]` or `None`.
-pub fn validate_u32_range_min_1(value: &Option<u32>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(1), None))
-}
-
-/// Validate the value is in `[100, ]` or `None`.
-pub fn validate_u64_range_min_100(value: &Option<u64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(100), None))
-}
-
-/// Validate the value is in `[1000, ]` or `None`.
-pub fn validate_u64_range_min_1000(value: &Option<u64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(1000), None))
-}
-
-/// Validate the value is in `[4, ]` or `None`.
-pub fn validate_u64_range_min_4(value: &Option<u64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(4), None))
-}
-
-/// Validate the value is in `[4, 10000]` or `None`.
-pub fn validate_u64_range_min_4_max_10000(value: &Option<u64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(4), Some(10_000)))
-}
-
-/// Validate the value is in `[0.5, 1.0]` or `None`.
-pub fn validate_f32_range_min_0_5_max_1(value: &Option<f32>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(0.5), Some(1.0)))
-}
-
-/// Validate the value is in `[0.0, 1.0]` or `None`.
-pub fn validate_f64_range_1(value: &Option<f64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(0.0), Some(1.0)))
-}
-
-/// Validate the value is in `[1.0, ]` or `None`.
-pub fn validate_f64_range_min_1(value: &Option<f64>) -> Result<(), ValidationError> {
-    value.map_or(Ok(()), |v| validate_range_generic(v, Some(1.0), None))
-}
-
-/// Validate the list of named vectors is not empty.
-pub fn validate_named_vectors_not_empty(
-    value: &Option<NamedVectors>,
-) -> Result<(), ValidationError> {
-    // If length is non-zero, we're good
-    match value {
-        Some(vectors) if !vectors.vectors.is_empty() => return Ok(()),
-        Some(_) | None => {}
+impl Validate for grpc::Vector {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match (&self.indices, self.vectors_count) {
+            (Some(_), Some(_)) => {
+                let mut errors = ValidationErrors::new();
+                errors.add(
+                    "indices",
+                    ValidationError::new("`indices` and `vectors_count` cannot be both specified"),
+                );
+                Err(errors)
+            }
+            (Some(indices), None) => sparse::common::sparse_vector::validate_sparse_vector_impl(
+                &indices.data,
+                &self.data,
+            ),
+            (None, Some(vectors_count)) => {
+                common::validation::validate_multi_vector_len(vectors_count, &self.data)
+            }
+            (None, None) => Ok(()),
+        }
     }
+}
 
-    let mut err = ValidationError::new("length");
-    err.add_param(Cow::from("min"), &1);
-    Err(err)
+impl Validate for super::qdrant::vectors::VectorsOptions {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            super::qdrant::vectors::VectorsOptions::Vector(v) => v.validate(),
+            super::qdrant::vectors::VectorsOptions::Vectors(v) => v.validate(),
+        }
+    }
+}
+
+impl Validate for super::qdrant::query_enum::Query {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            super::qdrant::query_enum::Query::NearestNeighbors(q) => q.validate(),
+            super::qdrant::query_enum::Query::RecommendBestScore(q) => q.validate(),
+            super::qdrant::query_enum::Query::Discover(q) => q.validate(),
+            super::qdrant::query_enum::Query::Context(q) => q.validate(),
+        }
+    }
 }
 
 /// Validate that GeoLineString has at least 4 points and is closed.
-pub fn validate_geo_polygon_line_helper(line: &GeoLineString) -> Result<(), ValidationError> {
+pub fn validate_geo_polygon_line_helper(line: &grpc::GeoLineString) -> Result<(), ValidationError> {
     let points = &line.points;
     let min_length = 4;
     if points.len() < min_length {
@@ -232,23 +292,32 @@ pub fn validate_geo_polygon_line_helper(line: &GeoLineString) -> Result<(), Vali
     Ok(())
 }
 
-pub fn validate_geo_polygon_exterior(line: &Option<GeoLineString>) -> Result<(), ValidationError> {
-    match line {
-        Some(l) => {
-            if l.points.is_empty() {
-                return Err(ValidationError::new("not_empty"));
-            }
-            validate_geo_polygon_line_helper(l)?;
-            Ok(())
-        }
-        _ => Err(ValidationError::new("not_empty")),
+pub fn validate_geo_polygon_exterior(line: &grpc::GeoLineString) -> Result<(), ValidationError> {
+    if line.points.is_empty() {
+        return Err(ValidationError::new("not_empty"));
     }
+    validate_geo_polygon_line_helper(line)?;
+    Ok(())
 }
 
-pub fn validate_geo_polygon_interiors(lines: &Vec<GeoLineString>) -> Result<(), ValidationError> {
+pub fn validate_geo_polygon_interiors(
+    lines: &Vec<grpc::GeoLineString>,
+) -> Result<(), ValidationError> {
     for line in lines {
         validate_geo_polygon_line_helper(line)?;
     }
+    Ok(())
+}
+
+/// Validate that the timestamp is within the range specified in the protobuf docs.
+/// <https://protobuf.dev/reference/protobuf/google.protobuf/#timestamp>
+pub fn validate_timestamp(ts: &prost_wkt_types::Timestamp) -> Result<(), ValidationError> {
+    validate_range_generic(
+        ts.seconds,
+        Some(TIMESTAMP_MIN_SECONDS),
+        Some(TIMESTAMP_MAX_SECONDS),
+    )?;
+    validate_range_generic(ts.nanos, Some(0), Some(999_999_999))?;
     Ok(())
 }
 

@@ -15,7 +15,6 @@ impl Mem {
         }
     }
 
-    #[allow(dead_code)]
     pub fn refresh(&mut self) {
         #[cfg(target_os = "linux")]
         if let Some(cgroups) = &mut self.cgroups {
@@ -133,7 +132,7 @@ mod cgroups_mem {
 }
 
 mod sysinfo_mem {
-    use sysinfo::{RefreshKind, System, SystemExt as _};
+    use sysinfo::{MemoryRefreshKind, RefreshKind, System};
 
     #[derive(Debug)]
     pub struct SysinfoMem {
@@ -142,8 +141,9 @@ mod sysinfo_mem {
 
     impl SysinfoMem {
         pub fn new() -> Self {
-            let mut system = System::new_with_specifics(RefreshKind::new().with_memory());
-            system.refresh_memory();
+            let system = System::new_with_specifics(
+                RefreshKind::nothing().with_memory(MemoryRefreshKind::everything()),
+            );
             Self { system }
         }
 

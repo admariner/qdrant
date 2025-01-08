@@ -1,8 +1,5 @@
 use std::collections::HashSet;
-use std::num::NonZeroU64;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rand::rngs::ThreadRng;
@@ -16,16 +13,14 @@ use segment::segment_constructor::simple_segment_constructor::{
 };
 use segment::types::{Distance, Payload, PointIdType, SeqNumberType};
 use serde_json::json;
-use tempfile::Builder;
 
-use crate::collection_manager::holders::segment_holder::{LockedSegment, SegmentHolder};
+use crate::collection_manager::holders::segment_holder::SegmentHolder;
 use crate::collection_manager::optimizers::indexing_optimizer::IndexingOptimizer;
 use crate::collection_manager::optimizers::merge_optimizer::MergeOptimizer;
-use crate::collection_manager::optimizers::segment_optimizer::{
-    OptimizerThresholds, SegmentOptimizer,
-};
+use crate::collection_manager::optimizers::segment_optimizer::OptimizerThresholds;
 use crate::config::CollectionParams;
-use crate::operations::types::{VectorParams, VectorsConfig};
+use crate::operations::types::VectorsConfig;
+use crate::operations::vector_params_builder::VectorParamsBuilder;
 
 pub fn empty_segment(path: &Path) -> Segment {
     build_simple_segment(path, 4, Distance::Dot).unwrap()
@@ -33,7 +28,7 @@ pub fn empty_segment(path: &Path) -> Segment {
 
 /// A generator for random point IDs
 #[derive(Default)]
-struct PointIdGenerator {
+pub(crate) struct PointIdGenerator {
     thread_rng: ThreadRng,
     used: HashSet<u64>,
 }
@@ -74,8 +69,8 @@ pub fn random_multi_vec_segment(
         let random_vector1: Vec<_> = (0..dim1).map(|_| rnd.gen_range(0.0..1.0)).collect();
         let random_vector2: Vec<_> = (0..dim2).map(|_| rnd.gen_range(0.0..1.0)).collect();
         let mut vectors = NamedVectors::default();
-        vectors.insert("vector1".to_owned(), random_vector1);
-        vectors.insert("vector2".to_owned(), random_vector2);
+        vectors.insert("vector1".to_owned(), random_vector1.into());
+        vectors.insert("vector2".to_owned(), random_vector2.into());
 
         let point_id: PointIdType = id_gen.unique();
         let payload_value = rnd.gen_range(1..1_000);
@@ -83,7 +78,9 @@ pub fn random_multi_vec_segment(
         let payload: Payload =
             json!({ payload_key: vec![payload_value], keyword_key: random_keyword}).into();
         segment.upsert_point(opnum, point_id, vectors).unwrap();
-        segment.set_payload(opnum, point_id, &payload).unwrap();
+        segment
+            .set_payload(opnum, point_id, &payload, &None)
+            .unwrap();
     }
     segment
 }
@@ -101,7 +98,9 @@ pub fn random_segment(path: &Path, opnum: SeqNumberType, num_vectors: u64, dim: 
         segment
             .upsert_point(opnum, point_id, only_default_vector(&random_vector))
             .unwrap();
-        segment.set_payload(opnum, point_id, &payload).unwrap();
+        segment
+            .set_payload(opnum, point_id, &payload, &None)
+            .unwrap();
     }
     segment
 }
@@ -138,11 +137,21 @@ pub fn build_segment_1(path: &Path) -> Segment {
         json!({ payload_key: vec!["red".to_owned(), "blue".to_owned()] }).into();
     let payload_option3: Payload = json!({ payload_key: vec!["blue".to_owned()] }).into();
 
-    segment1.set_payload(6, 1.into(), &payload_option1).unwrap();
-    segment1.set_payload(6, 2.into(), &payload_option1).unwrap();
-    segment1.set_payload(6, 3.into(), &payload_option3).unwrap();
-    segment1.set_payload(6, 4.into(), &payload_option2).unwrap();
-    segment1.set_payload(6, 5.into(), &payload_option2).unwrap();
+    segment1
+        .set_payload(6, 1.into(), &payload_option1, &None)
+        .unwrap();
+    segment1
+        .set_payload(6, 2.into(), &payload_option1, &None)
+        .unwrap();
+    segment1
+        .set_payload(6, 3.into(), &payload_option3, &None)
+        .unwrap();
+    segment1
+        .set_payload(6, 4.into(), &payload_option2, &None)
+        .unwrap();
+    segment1
+        .set_payload(6, 5.into(), &payload_option2, &None)
+        .unwrap();
 
     segment1
 }
@@ -191,8 +200,8 @@ pub fn build_test_holder(path: &Path) -> RwLock<SegmentHolder> {
 
     let mut holder = SegmentHolder::default();
 
-    let _sid1 = holder.add(segment1);
-    let _sid2 = holder.add(segment2);
+    let _sid1 = holder.add_new(segment1);
+    let _sid2 = holder.add_new(segment2);
 
     RwLock::new(holder)
 }
@@ -201,24 +210,21 @@ pub(crate) fn get_merge_optimizer(
     segment_path: &Path,
     collection_temp_dir: &Path,
     dim: usize,
+    optimizer_thresholds: Option<OptimizerThresholds>,
 ) -> MergeOptimizer {
     MergeOptimizer::new(
         5,
-        OptimizerThresholds {
-            max_segment_size: 100_000,
-            memmap_threshold: 1000000,
-            indexing_threshold: 1000000,
-        },
+        optimizer_thresholds.unwrap_or(OptimizerThresholds {
+            max_segment_size_kb: 100_000,
+            memmap_threshold_kb: 1_000_000,
+            indexing_threshold_kb: 1_000_000,
+        }),
         segment_path.to_owned(),
         collection_temp_dir.to_owned(),
         CollectionParams {
-            vectors: VectorsConfig::Single(VectorParams {
-                size: NonZeroU64::new(dim as u64).unwrap(),
-                distance: Distance::Dot,
-                hnsw_config: None,
-                quantization_config: None,
-                on_disk: None,
-            }),
+            vectors: VectorsConfig::Single(
+                VectorParamsBuilder::new(dim as u64, Distance::Dot).build(),
+            ),
             ..CollectionParams::empty()
         },
         Default::default(),
@@ -232,56 +238,21 @@ pub(crate) fn get_indexing_optimizer(
     dim: usize,
 ) -> IndexingOptimizer {
     IndexingOptimizer::new(
+        2,
         OptimizerThresholds {
-            max_segment_size: 100_000,
-            memmap_threshold: 100,
-            indexing_threshold: 100,
+            max_segment_size_kb: 100_000,
+            memmap_threshold_kb: 100,
+            indexing_threshold_kb: 100,
         },
         segment_path.to_owned(),
         collection_temp_dir.to_owned(),
         CollectionParams {
-            vectors: VectorsConfig::Single(VectorParams {
-                size: NonZeroU64::new(dim as u64).unwrap(),
-                distance: Distance::Dot,
-                hnsw_config: None,
-                quantization_config: None,
-                on_disk: None,
-            }),
+            vectors: VectorsConfig::Single(
+                VectorParamsBuilder::new(dim as u64, Distance::Dot).build(),
+            ),
             ..CollectionParams::empty()
         },
         Default::default(),
         Default::default(),
     )
-}
-
-pub fn optimize_segment(segment: Segment) -> LockedSegment {
-    let dir = Builder::new().prefix("segment_dir_tmp").tempdir().unwrap();
-
-    let segments_dir = segment.current_path.parent().unwrap().to_owned();
-
-    let dim = segment.segment_config.vector_data.get("").unwrap().size;
-
-    let mut holder = SegmentHolder::default();
-
-    let segment_id = holder.add(segment);
-
-    let optimizer = get_indexing_optimizer(&segments_dir, dir.path(), dim);
-
-    let locked_holder: Arc<parking_lot::lock_api::RwLock<_, _>> = Arc::new(RwLock::new(holder));
-
-    optimizer
-        .optimize(
-            locked_holder.clone(),
-            vec![segment_id],
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-    let mut holder = locked_holder.write();
-
-    let segment_id = *holder.non_appendable_segments().first().unwrap();
-
-    let mut segments = holder.remove(&[segment_id]);
-
-    segments.pop().unwrap()
 }

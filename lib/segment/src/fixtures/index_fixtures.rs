@@ -1,26 +1,27 @@
 use std::marker::PhantomData;
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
 use bitvec::prelude::{BitSlice, BitVec};
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use rand::Rng;
 
 use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
-use crate::data_types::vectors::{VectorElementType, VectorType};
+use crate::data_types::named_vectors::CowVector;
+use crate::data_types::vectors::{DenseVector, VectorElementType, VectorRef};
 use crate::payload_storage::FilterContext;
 use crate::spaces::metric::Metric;
-use crate::types::{Distance, QuantizationConfig};
+use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
-use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 use crate::vector_storage::{
-    raw_scorer_impl, RawScorer, VectorStorage, VectorStorageEnum, DEFAULT_STOPPED,
+    raw_scorer_impl, DenseVectorStorage, RawScorer, VectorStorage, DEFAULT_STOPPED,
 };
 
-pub fn random_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -> Vec<VectorElementType> {
-    (0..size).map(|_| rnd_gen.gen_range(0.0..1.0)).collect()
+pub fn random_vector<R: Rng + ?Sized>(rnd_gen: &mut R, size: usize) -> DenseVector {
+    (0..size).map(|_| rnd_gen.gen_range(-1.0..1.0)).collect()
 }
 
 pub struct FakeFilterContext {}
@@ -31,43 +32,58 @@ impl FilterContext for FakeFilterContext {
     }
 }
 
-pub struct TestRawScorerProducer<TMetric: Metric> {
+pub struct TestRawScorerProducer<TMetric: Metric<VectorElementType>> {
     pub vectors: ChunkedVectors<VectorElementType>,
     pub deleted_points: BitVec,
     pub deleted_vectors: BitVec,
     pub metric: PhantomData<TMetric>,
 }
 
-impl<TMetric: Metric> VectorStorage for TestRawScorerProducer<TMetric> {
+impl<TMetric: Metric<VectorElementType>> DenseVectorStorage<VectorElementType>
+    for TestRawScorerProducer<TMetric>
+{
     fn vector_dim(&self) -> usize {
         self.vectors.get(0).len()
     }
 
+    fn get_dense(&self, key: PointOffsetType) -> &[VectorElementType] {
+        self.vectors.get(key as _)
+    }
+}
+
+impl<TMetric: Metric<VectorElementType>> VectorStorage for TestRawScorerProducer<TMetric> {
     fn distance(&self) -> Distance {
         TMetric::distance()
+    }
+
+    fn datatype(&self) -> VectorStorageDatatype {
+        VectorStorageDatatype::Float32
+    }
+
+    fn is_on_disk(&self) -> bool {
+        false
     }
 
     fn total_vector_count(&self) -> usize {
         self.vectors.len()
     }
 
-    fn get_vector(&self, key: PointOffsetType) -> &[VectorElementType] {
-        self.vectors.get(key)
+    fn get_vector(&self, key: PointOffsetType) -> CowVector {
+        self.get_vector_opt(key).expect("vector not found")
     }
 
-    fn insert_vector(
-        &mut self,
-        key: PointOffsetType,
-        vector: &[VectorElementType],
-    ) -> OperationResult<()> {
-        self.vectors.insert(key, vector)?;
+    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
+        self.vectors.get_opt(key as _).map(|v| v.into())
+    }
+
+    fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
+        self.vectors.insert(key as _, vector.try_into()?)?;
         Ok(())
     }
 
-    fn update_from(
+    fn update_from<'a>(
         &mut self,
-        _other: &VectorStorageEnum,
-        _other_ids: &mut dyn Iterator<Item = PointOffsetType>,
+        _other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         _stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         todo!()
@@ -75,24 +91,6 @@ impl<TMetric: Metric> VectorStorage for TestRawScorerProducer<TMetric> {
 
     fn flusher(&self) -> Flusher {
         Box::new(|| Ok(()))
-    }
-
-    fn quantize(
-        &mut self,
-        _data_path: &Path,
-        _quantization_config: &QuantizationConfig,
-        _max_threads: usize,
-        _stopped: &AtomicBool,
-    ) -> OperationResult<()> {
-        Ok(())
-    }
-
-    fn load_quantization(&mut self, _data_path: &Path) -> OperationResult<()> {
-        Ok(())
-    }
-
-    fn quantized_storage(&self) -> Option<&QuantizedVectors> {
-        None
     }
 
     fn files(&self) -> Vec<PathBuf> {
@@ -118,7 +116,7 @@ impl<TMetric: Metric> VectorStorage for TestRawScorerProducer<TMetric> {
 
 impl<TMetric> TestRawScorerProducer<TMetric>
 where
-    TMetric: Metric,
+    TMetric: Metric<VectorElementType>,
 {
     pub fn new<R>(dim: usize, num_vectors: usize, rng: &mut R) -> Self
     where
@@ -138,13 +136,14 @@ where
         }
     }
 
-    pub fn get_raw_scorer(&self, query: VectorType) -> Box<dyn RawScorer + '_> {
+    pub fn get_raw_scorer(&self, query: DenseVector) -> OperationResult<Box<dyn RawScorer + '_>> {
         let query = TMetric::preprocess(query).into();
         raw_scorer_impl(
             query,
             self,
             self.deleted_vector_bitslice(),
             &DEFAULT_STOPPED,
+            HardwareCounterCell::new(),
         )
     }
 }

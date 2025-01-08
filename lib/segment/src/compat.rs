@@ -52,6 +52,8 @@ impl From<SegmentConfigV5> for SegmentConfig {
                     storage_type: (old_data.on_disk == Some(true))
                         .then_some(VectorStorageType::Mmap)
                         .unwrap_or_else(|| old_segment.storage_type.into()),
+                    multivector_config: None,
+                    datatype: None,
                 };
 
                 (vector_name, new_data)
@@ -60,6 +62,7 @@ impl From<SegmentConfigV5> for SegmentConfig {
 
         SegmentConfig {
             vector_data,
+            sparse_vector_data: Default::default(),
             payload_storage_type: old_segment.payload_storage_type,
         }
     }
@@ -188,7 +191,7 @@ mod tests {
 
         let new_segment: SegmentConfig = old_segment.into();
 
-        eprintln!("new = {:#?}", new_segment);
+        eprintln!("new = {new_segment:#?}");
 
         match &new_segment.vector_data.get("vec1").unwrap().index {
             Indexes::Plain { .. } => panic!("expected HNSW index"),
@@ -269,7 +272,7 @@ mod tests {
 
         let new_segment: SegmentConfig = old_segment.into();
 
-        eprintln!("new = {:#?}", new_segment);
+        eprintln!("new = {new_segment:#?}");
 
         if new_segment
             .vector_data

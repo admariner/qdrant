@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use collection::collection::Collection;
 use collection::shards::shard::PeerId;
 use log::info;
+use segment::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
 use storage::content_manager::alias_mapping::AliasPersistence;
 use storage::content_manager::snapshots::SnapshotConfig;
 use storage::content_manager::toc::{ALIASES_PATH, COLLECTIONS_DIR};
@@ -94,8 +95,7 @@ pub fn recover_full_snapshot(
     fs::create_dir_all(&snapshot_temp_path).unwrap();
 
     // Un-tar snapshot into temporary directory
-    let archive_file = fs::File::open(snapshot_path).unwrap();
-    let mut ar = tar::Archive::new(archive_file);
+    let mut ar = open_snapshot_archive_with_validation(Path::new(snapshot_path)).unwrap();
     ar.unpack(&snapshot_temp_path).unwrap();
 
     // Read configuration file with snapshot-to-collection mapping
@@ -127,7 +127,7 @@ pub fn recover_full_snapshot(
 
     let alias_path = Path::new(storage_dir).join(ALIASES_PATH);
     let mut alias_persistence =
-        AliasPersistence::open(alias_path).expect("Can't open database by the provided config");
+        AliasPersistence::open(&alias_path).expect("Can't open database by the provided config");
     for (alias, collection_name) in config_json.collections_aliases {
         if alias_persistence.get(&alias).is_some() && !force {
             panic!("Alias {alias} already exists. Use --force-snapshot to overwrite it.");

@@ -10,7 +10,6 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use wal::{Wal, WalOptions};
 
-#[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
 #[error("{0}")]
 pub enum WalError {
@@ -20,6 +19,8 @@ pub enum WalError {
     WriteWalError(String),
     #[error("Can't truncate WAL: {0}")]
     TruncateWalError(String),
+    #[error("Operation rejected by WAL for old clock")]
+    ClockRejected,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -43,7 +44,7 @@ enum TestRecord {
     Struct2(TestInternalStruct2),
 }
 
-type Result<T> = result::Result<T, WalError>;
+pub(super) type Result<T> = result::Result<T, WalError>;
 
 #[derive(Debug, Deserialize, Serialize)]
 struct WalState {
@@ -62,16 +63,18 @@ impl WalState {
 /// Each stored record is enumerated with sequential number.
 /// Sequential number can be used to read stored records starting from some IDs,
 /// for removing old, no longer required, records.
+#[derive(Debug)]
 pub struct SerdeWal<R> {
     record: PhantomData<R>,
     wal: Wal,
     options: WalOptions,
+    /// First index of our logical WAL.
     first_index: Option<u64>,
 }
 
 const FIRST_INDEX_FILE: &str = "first-index";
 
-impl<'s, R: DeserializeOwned + Serialize + Debug> SerdeWal<R> {
+impl<R: DeserializeOwned + Serialize + Debug> SerdeWal<R> {
     pub fn new(dir: &str, wal_options: WalOptions) -> Result<SerdeWal<R>> {
         let wal = Wal::with_options(dir, &wal_options)
             .map_err(|err| WalError::InitWalError(format!("{err:?}")))?;
@@ -109,18 +112,47 @@ impl<'s, R: DeserializeOwned + Serialize + Debug> SerdeWal<R> {
             .map_err(|err| WalError::WriteWalError(format!("{err:?}")))
     }
 
-    pub fn read_all(&'s self) -> impl Iterator<Item = (u64, R)> + 's {
-        self.read(self.first_index())
+    pub fn read_all(
+        &self,
+        with_acknowledged: bool,
+    ) -> impl DoubleEndedIterator<Item = (u64, R)> + '_ {
+        if with_acknowledged {
+            self.read(self.first_closed_index())
+        } else {
+            self.read(self.first_index())
+        }
+    }
+
+    pub fn read(&self, from: u64) -> impl DoubleEndedIterator<Item = (u64, R)> + '_ {
+        // We have to explicitly do `from..self.first_index() + self.len(false)`, instead of more
+        // concise `from..=self.last_index()`, because if the WAL is empty, `Wal::last_index`
+        // returns `Wal::first_index`, so we end up with `1..=1` instead of an empty range. 😕
+
+        let to = self.first_index() + self.len(false);
+
+        (from..to).map(move |idx| {
+            let record_bin = self.wal.entry(idx).expect("Can't read entry from WAL");
+
+            let record: R = serde_cbor::from_slice(&record_bin)
+                .or_else(|_err| rmp_serde::from_slice(&record_bin))
+                .expect("Can't deserialize entry, probably corrupted WAL or version mismatch");
+
+            (idx, record)
+        })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len(false) == 0
     }
 
-    pub fn len(&self) -> u64 {
-        self.wal
-            .num_entries()
-            .saturating_sub(self.truncated_prefix_entries_num())
+    pub fn len(&self, with_acknowledged: bool) -> u64 {
+        if with_acknowledged {
+            self.wal.num_entries()
+        } else {
+            self.wal
+                .num_entries()
+                .saturating_sub(self.truncated_prefix_entries_num())
+        }
     }
 
     // WAL operates in *segments*, so when `Wal::prefix_truncate` is called (during `SerdeWal::ack`),
@@ -143,39 +175,26 @@ impl<'s, R: DeserializeOwned + Serialize + Debug> SerdeWal<R> {
         self.first_index().saturating_sub(self.wal.first_index())
     }
 
-    pub fn read(&'s self, start_from: u64) -> impl Iterator<Item = (u64, R)> + 's {
-        let first_index = self.first_index();
-        let len = self.len();
-
-        (start_from..(first_index + len)).map(move |idx| {
-            let record_bin = self.wal.entry(idx).expect("Can't read entry from WAL");
-            let record: R = serde_cbor::from_slice(&record_bin)
-                .or_else(|_err| rmp_serde::from_slice(&record_bin))
-                .expect("Can't deserialize entry, probably corrupted WAL on version mismatch");
-            (idx, record)
-        })
-    }
-
     /// Inform WAL, that records older than `until_index` are no longer required.
     /// If it is possible, WAL will remove unused files.
     ///
     /// # Arguments
     ///
     /// * `until_index` - the newest no longer required record sequence number
-    ///
-    pub fn ack(&mut self, until_index: u64) -> Result<()> {
+    pub(super) fn ack(&mut self, until_index: u64) -> Result<()> {
         // Truncate WAL
         self.wal
             .prefix_truncate(until_index)
             .map_err(|err| WalError::TruncateWalError(format!("{err:?}")))?;
 
         // Acknowledge index should not decrease
-        let minimal_first_index = self.first_index.unwrap_or(self.wal.first_index());
+        let minimal_first_index = self.first_index.unwrap_or_else(|| self.wal.first_index());
         let new_first_index = Some(
             until_index
                 .max(minimal_first_index)
                 .min(self.wal.last_index()),
         );
+
         // Update current `first_index`
         if self.first_index != new_first_index {
             self.first_index = new_first_index;
@@ -217,10 +236,21 @@ impl<'s, R: DeserializeOwned + Serialize + Debug> SerdeWal<R> {
         self.wal.path()
     }
 
-    pub fn first_index(&self) -> u64 {
-        self.first_index.unwrap_or_else(|| self.wal.first_index())
+    /// First index that we still have in the first closed segment.
+    ///
+    /// If the index is lower than `first_index`, it means we have already acknowledged it but we
+    /// are still holding it in a closed segment until it gets truncated.
+    pub fn first_closed_index(&self) -> u64 {
+        self.wal.first_index()
     }
 
+    /// First index that is in our logical WAL, right after the last acknowledged operation.
+    pub fn first_index(&self) -> u64 {
+        self.first_index
+            .unwrap_or_else(|| self.first_closed_index())
+    }
+
+    /// Last index that is still available in logical WAL.
     pub fn last_index(&self) -> u64 {
         self.wal.last_index()
     }

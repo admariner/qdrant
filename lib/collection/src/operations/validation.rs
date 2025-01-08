@@ -1,4 +1,5 @@
 use actix_web_validator::error::flatten_errors;
+use serde_json::Value;
 use validator::{ValidationError, ValidationErrors};
 
 /// Warn about validation errors in the log.
@@ -45,6 +46,8 @@ fn describe_error(
     // Prefer to return message if set
     if let Some(message) = message {
         return message.to_string();
+    } else if let Some(Value::String(message)) = params.get("message") {
+        return message.to_string();
     }
 
     // Generate messages based on codes
@@ -78,6 +81,28 @@ fn describe_error(
                 None => msg,
             }
         }
+        "must_not_match" => {
+            match (
+                params.get("value"),
+                params.get("other_field"),
+                params.get("other_value"),
+            ) {
+                (Some(value), Some(other_field), Some(other_value)) => {
+                    format!("value {value} must not match {other_value} in {other_field}")
+                }
+                (Some(value), Some(other_field), None) => {
+                    format!("value {value} must not match value in {other_field}")
+                }
+                (None, Some(other_field), Some(other_value)) => {
+                    format!("must not match {other_value} in {other_field}")
+                }
+                (None, Some(other_field), None) => {
+                    format!("must not match value in {other_field}")
+                }
+                // Should be unreachable
+                _ => err.to_string(),
+            }
+        }
         "does_not_contain" => match params.get("pattern") {
             Some(pattern) => format!("cannot contain {pattern}"),
             None => err.to_string(),
@@ -88,10 +113,9 @@ fn describe_error(
                 .to_string()
         }
         "min_line_length" => match (params.get("min_length"), params.get("length")) {
-            (Some(min_length), Some(length)) => format!(
-                "value invalid, the size must be at least {}, got {}",
-                min_length, length
-            ),
+            (Some(min_length), Some(length)) => {
+                format!("value invalid, the size must be at least {min_length}, got {length}")
+            }
             _ => err.to_string(),
         },
         // Undescribed error codes
@@ -114,7 +138,7 @@ mod tests {
 
     #[derive(Validate, Debug)]
     struct OtherThing {
-        #[validate]
+        #[validate(nested)]
         pub things: Vec<SomeThing>,
     }
 
@@ -174,7 +198,7 @@ mod tests {
             describe_errors(&errors),
             vec![(
                 "things[0].idx".into(),
-                "value 0 invalid, must be 1.0 or larger".into()
+                "value 0 invalid, must be 1 or larger".into()
             )]
         );
     }

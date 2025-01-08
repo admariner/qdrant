@@ -25,11 +25,11 @@ pub fn random_segment(path: &Path, num_points: usize) -> Segment {
             .upsert_point(
                 100,
                 (point_id as u64).into(),
-                NamedVectors::from_ref(DEFAULT_VECTOR_NAME, &vector),
+                NamedVectors::from_ref(DEFAULT_VECTOR_NAME, vector.as_slice().into()),
             )
             .unwrap();
         segment
-            .set_payload(100, (point_id as u64).into(), &payload)
+            .set_payload(100, (point_id as u64).into(), &payload, &None)
             .unwrap();
     }
 

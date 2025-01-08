@@ -1,5 +1,4 @@
 /target
-/benches/search-points/target
 /.idea
 /.vscode
 /.devcontainer
@@ -11,3 +10,9 @@
 /static
 *.log
 .qdrant-initialized
+/.hypothesis
+**/__pycache__
+tests/storage-compat/compatibility.tar
+tests/storage-compat/full-snapshot.snapshot.gz
+tests/storage-compat/storage.tar.bz2
+venv

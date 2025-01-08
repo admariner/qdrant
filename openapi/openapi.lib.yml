@@ -18,13 +18,19 @@ default:
       schema:
         type: object
         properties:
+          usage:
+            default: null
+            anyOf:
+              - $ref: '#/components/schemas/HardwareUsage'
+              - nullable: true
           time:
             type: number
             format: float
             description: Time spent to process this request
+            example: 0.002
           status:
             type: string
-            enum: [ "ok" ]
+            example: ok
           result: #@ model
 #@ end
 
@@ -52,9 +58,10 @@ default:
             type: number
             format: float
             description: Time spent to process this request
+            example: 0.002
           status:
             type: string
-            enum: [ "ok" ]
+            example: ok
           result: #@ model
 "202":
   description: operation is accepted
@@ -69,7 +76,6 @@ default:
             description: Time spent to process this request
           status:
             type: string
-            enum: [ "accepted" ]
 #@ end
 
 #@ def reference(model_name):

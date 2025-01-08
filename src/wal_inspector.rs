@@ -1,7 +1,7 @@
 use std::env;
 use std::path::Path;
 
-use collection::operations::CollectionUpdateOperations;
+use collection::operations::OperationWithClockTag;
 use collection::wal::SerdeWal;
 use storage::content_manager::consensus::consensus_wal::ConsensusOpWal;
 use storage::content_manager::consensus_ops::ConsensusOperations;
@@ -18,7 +18,7 @@ fn main() {
     match wal_type {
         "collection" => print_collection_wal(wal_path),
         "consensus" => print_consensus_wal(wal_path),
-        _ => eprintln!("Unknown wal type: {}", wal_type),
+        _ => eprintln!("Unknown wal type: {wal_type}"),
     }
 }
 
@@ -27,10 +27,13 @@ fn print_consensus_wal(wal_path: &Path) {
     let wal = ConsensusOpWal::new(wal_path.to_str().unwrap());
     println!("==========================");
     let first_index = wal.first_entry().unwrap();
-    println!("First entry: {:?}", first_index);
+    println!("First entry: {first_index:?}");
     let last_index = wal.last_entry().unwrap();
-    println!("Last entry: {:?}", last_index);
-    println!("Offset of first entry: {:?}", wal.index_offset().unwrap());
+    println!("Last entry: {last_index:?}");
+    println!(
+        "Offset of first entry: {:?}",
+        wal.index_offset().unwrap().wal_to_raft_offset
+    );
     let entries = wal
         .entries(
             first_index.map(|f| f.index).unwrap_or(1),
@@ -42,7 +45,7 @@ fn print_consensus_wal(wal_path: &Path) {
         println!("==========================");
         let command = ConsensusOperations::try_from(&entry);
         let data = match command {
-            Ok(command) => format!("{:?}", command),
+            Ok(command) => format!("{command:?}"),
             Err(_) => format!("{:?}", entry.data),
         };
         println!(
@@ -53,7 +56,7 @@ fn print_consensus_wal(wal_path: &Path) {
 }
 
 fn print_collection_wal(wal_path: &Path) {
-    let wal: Result<SerdeWal<CollectionUpdateOperations>, _> =
+    let wal: Result<SerdeWal<OperationWithClockTag>, _> =
         SerdeWal::new(wal_path.to_str().unwrap(), WalOptions::default());
 
     match wal {
@@ -63,15 +66,17 @@ fn print_collection_wal(wal_path: &Path) {
         Ok(wal) => {
             // print all entries
             let mut count = 0;
-            for (idx, op) in wal.read_all() {
+            for (idx, op) in wal.read_all(true) {
                 println!("==========================");
-                println!("Entry {}", idx);
-                println!("{:?}", op);
+                println!(
+                    "Entry: {idx} Operation: {:?} Clock: {:?}",
+                    op.operation, op.clock_tag
+                );
                 count += 1;
             }
             println!("==========================");
             println!("End of WAL.");
-            println!("Found {} entries.", count);
+            println!("Found {count} entries.");
         }
     }
 }

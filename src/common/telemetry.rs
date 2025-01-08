@@ -1,15 +1,20 @@
 use std::sync::Arc;
 
+use collection::operations::verification::new_unchecked_verification_pass;
+use common::types::{DetailsLevel, TelemetryDetail};
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use uuid::Uuid;
 
 use crate::common::telemetry_ops::app_telemetry::{AppBuildTelemetry, AppBuildTelemetryCollector};
 use crate::common::telemetry_ops::cluster_telemetry::ClusterTelemetry;
 use crate::common::telemetry_ops::collections_telemetry::CollectionsTelemetry;
+use crate::common::telemetry_ops::hardware::HardwareTelemetry;
+use crate::common::telemetry_ops::memory_telemetry::MemoryTelemetry;
 use crate::common::telemetry_ops::requests_telemetry::{
     ActixTelemetryCollector, RequestsTelemetry, TonicTelemetryCollector,
 };
@@ -25,13 +30,19 @@ pub struct TelemetryCollector {
 }
 
 // Whole telemetry data
-#[derive(Serialize, Deserialize, Clone, Debug, JsonSchema)]
+#[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct TelemetryData {
     id: String,
     pub(crate) app: AppBuildTelemetry,
     pub(crate) collections: CollectionsTelemetry,
-    pub(crate) cluster: ClusterTelemetry,
-    pub(crate) requests: RequestsTelemetry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cluster: Option<ClusterTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) requests: Option<RequestsTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) memory: Option<MemoryTelemetry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) hardware: Option<HardwareTelemetry>,
 }
 
 impl Anonymize for TelemetryData {
@@ -42,6 +53,8 @@ impl Anonymize for TelemetryData {
             collections: self.collections.anonymize(),
             cluster: self.cluster.anonymize(),
             requests: self.requests.anonymize(),
+            memory: self.memory.anonymize(),
+            hardware: self.hardware.anonymize(),
         }
     }
 }
@@ -70,16 +83,29 @@ impl TelemetryCollector {
         }
     }
 
-    pub async fn prepare_data(&self, level: usize) -> TelemetryData {
+    pub async fn prepare_data(&self, access: &Access, detail: TelemetryDetail) -> TelemetryData {
         TelemetryData {
             id: self.process_id.to_string(),
-            collections: CollectionsTelemetry::collect(level, self.dispatcher.toc()).await,
-            app: AppBuildTelemetry::collect(level, &self.app_telemetry_collector, &self.settings),
-            cluster: ClusterTelemetry::collect(level, &self.dispatcher, &self.settings),
+            collections: CollectionsTelemetry::collect(
+                detail,
+                access,
+                self.dispatcher
+                    .toc(access, &new_unchecked_verification_pass()),
+            )
+            .await,
+            app: AppBuildTelemetry::collect(detail, &self.app_telemetry_collector, &self.settings),
+            cluster: ClusterTelemetry::collect(access, detail, &self.dispatcher, &self.settings),
             requests: RequestsTelemetry::collect(
+                access,
                 &self.actix_telemetry_collector.lock(),
                 &self.tonic_telemetry_collector.lock(),
+                detail,
             ),
+            memory: (detail.level > DetailsLevel::Level0)
+                .then(|| MemoryTelemetry::collect(access))
+                .flatten(),
+            hardware: (detail.level > DetailsLevel::Level0)
+                .then(|| HardwareTelemetry::new(&self.dispatcher, access)),
         }
     }
 }

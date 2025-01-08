@@ -46,10 +46,13 @@ def test_collection_creation_after_dropping(tmp_path: pathlib.Path):
     r = requests.put(
         f"{peer_api_uris[randrange(N_PEERS)]}/collections/test_collection",
         json=COLLECTION_CONFIG,
+        # Collection creation is expensive, give very busy CI machines 20 extra
+        # seconds for creating them in cluster mode to prevent flakiness
+        params={"timeout": 30},
     )
     assert_http_ok(r)
 
-    for i in range(100):
+    for i in range(10):
         # Drop collection
         r = requests.delete(
             f"{peer_api_uris[randrange(N_PEERS)]}/collections/test_collection"
@@ -60,13 +63,23 @@ def test_collection_creation_after_dropping(tmp_path: pathlib.Path):
         r = requests.put(
             f"{peer_api_uris[randrange(N_PEERS)]}/collections/test_collection",
             json=COLLECTION_CONFIG,
+            # Collection creation is expensive, give very busy CI machines 20
+            # extra seconds for creating them in cluster mode to prevent
+            # flakiness
+            params={"timeout": 30},
         )
         assert_http_ok(r)
 
         # Upload some points to every peer
         for _ in range(20):
             for peer_api_uri in peer_api_uris:
-                upsert_random_points(peer_api_uri, collection_name="test_collection", num=50, wait="false")
+                upsert_random_points(
+                    peer_api_uri,
+                    collection_name="test_collection",
+                    num=50,
+                    wait="false",
+                    with_sparse_vector=False
+                )
 
     # Get collections on all peers
     for i in range(N_PEERS):

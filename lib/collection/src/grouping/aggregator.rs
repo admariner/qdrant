@@ -1,31 +1,35 @@
+use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
-use common::types::ScoreType;
 use itertools::Itertools;
-use ordered_float::OrderedFloat;
 use segment::data_types::groups::GroupId;
+use segment::json_path::JsonPath;
 use segment::spaces::tools::{peek_top_largest_iterable, peek_top_smallest_iterable};
 use segment::types::{ExtendedPointId, Order, PayloadContainer, PointIdType, ScoredPoint};
 use serde_json::Value;
 
-use super::types::AggregatorError::{self, *};
-use super::types::Group;
+use super::types::{AggregatorError, Group};
 
 type Hits = HashMap<PointIdType, ScoredPoint>;
 pub(super) struct GroupsAggregator {
     groups: HashMap<GroupId, Hits>,
     max_group_size: usize,
-    grouped_by: String,
+    grouped_by: JsonPath,
     max_groups: usize,
     full_groups: HashSet<GroupId>,
-    group_best_scores: HashMap<GroupId, ScoreType>,
+    group_best_scores: HashMap<GroupId, ScoredPoint>,
     all_ids: HashSet<ExtendedPointId>,
-    order: Order,
+    order: Option<Order>,
 }
 
 impl GroupsAggregator {
-    pub(super) fn new(groups: usize, group_size: usize, grouped_by: String, order: Order) -> Self {
+    pub(super) fn new(
+        groups: usize,
+        group_size: usize,
+        grouped_by: JsonPath,
+        order: Option<Order>,
+    ) -> Self {
         Self {
             groups: HashMap::with_capacity(groups),
             max_group_size: group_size,
@@ -39,14 +43,13 @@ impl GroupsAggregator {
     }
 
     /// Adds a point to the group that corresponds based on the group_by field, assumes that the point has the group_by field
-    fn add_point(&mut self, point: ScoredPoint) -> Result<(), AggregatorError> {
+    fn add_point(&mut self, point: &ScoredPoint) -> Result<(), AggregatorError> {
         // extract all values from the group_by field
         let payload_values: Vec<_> = point
             .payload
             .as_ref()
             .map(|p| {
                 p.get_value(&self.grouped_by)
-                    .values()
                     .into_iter()
                     .flat_map(|v| match v {
                         Value::Array(arr) => arr.iter().collect(),
@@ -54,13 +57,13 @@ impl GroupsAggregator {
                     })
                     .collect()
             })
-            .ok_or(KeyNotFound)?;
+            .ok_or(AggregatorError::KeyNotFound)?;
 
         let group_keys = payload_values
             .into_iter()
             .map(GroupId::try_from)
             .collect::<Result<Vec<GroupId>, ()>>()
-            .map_err(|_| BadKeyType)?;
+            .map_err(|_| AggregatorError::BadKeyType)?;
 
         let unique_group_keys: Vec<_> = group_keys.into_iter().unique().collect();
 
@@ -92,22 +95,29 @@ impl GroupsAggregator {
             // Insert score if better than the group best score
             self.group_best_scores
                 .entry(group_key.clone())
-                .and_modify(|e| {
-                    *e = match self.order {
-                        Order::LargeBetter => point.score.max(*e),
-                        Order::SmallBetter => point.score.min(*e),
+                .and_modify(|other_score| {
+                    let ordering = match self.order {
+                        Some(Order::LargeBetter) => point.cmp(other_score),
+                        Some(Order::SmallBetter) => (*other_score).cmp(point),
+                        None => Ordering::Equal, // No order can mean random sampling.
+                    };
+                    if ordering == Ordering::Greater {
+                        *other_score = point.clone();
                     }
                 })
-                .or_insert(point.score);
+                .or_insert(point.clone());
         }
         Ok(())
     }
 
-    /// Adds multiple points to the group that they corresponds based on the group_by field, assumes that the points always have the grouped_by field, else it just ignores them
+    /// Adds multiple points to the group that they correspond to based on the group_by field, assumes that the points always have the grouped_by field, else it just ignores them
     pub(super) fn add_points(&mut self, points: &[ScoredPoint]) {
         for point in points {
-            match self.add_point(point.to_owned()) {
-                Ok(()) | Err(KeyNotFound | BadKeyType) => continue, // ignore points that don't have the group_by field
+            match self.add_point(point) {
+                Ok(()) | Err(AggregatorError::KeyNotFound | AggregatorError::BadKeyType) => {
+                    // ignore points that don't have the group_by field
+                    continue;
+                }
             }
         }
     }
@@ -118,20 +128,25 @@ impl GroupsAggregator {
     }
 
     /// Return `max_groups` number of keys of the groups with the best score
-    fn best_group_keys(&self) -> impl Iterator<Item = &GroupId> {
-        self.group_best_scores
+    fn best_group_keys(&self) -> Vec<GroupId> {
+        let mut pairs: Vec<_> = self.group_best_scores.iter().collect();
+
+        pairs.sort_unstable_by(|(_, score1), (_, score2)| match self.order {
+            Some(Order::LargeBetter) => score2.cmp(score1),
+            Some(Order::SmallBetter) => score1.cmp(score2),
+            None => Ordering::Equal,
+        });
+
+        pairs
             .iter()
-            .sorted_by_key(|(_, score)| match self.order {
-                Order::LargeBetter => -OrderedFloat(**score),
-                Order::SmallBetter => OrderedFloat(**score),
-            })
             .take(self.max_groups)
-            .map(|(k, _)| k)
+            .map(|(k, _)| (*k).clone())
+            .collect()
     }
 
     /// Gets the keys of the groups that have less than the max group size
     pub(super) fn keys_of_unfilled_best_groups(&self) -> Vec<Value> {
-        let best_group_keys: HashSet<_> = self.best_group_keys().cloned().collect();
+        let best_group_keys: HashSet<_> = self.best_group_keys().into_iter().collect();
         best_group_keys
             .difference(&self.full_groups)
             .cloned()
@@ -146,7 +161,7 @@ impl GroupsAggregator {
 
     /// Gets the amount of best groups that have reached the max group size
     pub(super) fn len_of_filled_best_groups(&self) -> usize {
-        let best_group_keys: HashSet<_> = self.best_group_keys().cloned().collect();
+        let best_group_keys: HashSet<_> = self.best_group_keys().into_iter().collect();
         best_group_keys.intersection(&self.full_groups).count()
     }
 
@@ -157,19 +172,20 @@ impl GroupsAggregator {
 
     /// Returns the best groups sorted by their best hit. The hits are sorted too.
     pub(super) fn distill(mut self) -> Vec<Group> {
-        let best_groups: Vec<_> = self.best_group_keys().cloned().collect();
+        let best_groups = self.best_group_keys();
         let mut groups = Vec::with_capacity(best_groups.len());
 
         for group_key in best_groups {
             let mut group = self.groups.remove(&group_key).unwrap();
             let scored_points_iter = group.drain().map(|(_, hit)| hit);
             let hits = match self.order {
-                Order::LargeBetter => {
+                Some(Order::LargeBetter) => {
                     peek_top_largest_iterable(scored_points_iter, self.max_group_size)
                 }
-                Order::SmallBetter => {
+                Some(Order::SmallBetter) => {
                     peek_top_smallest_iterable(scored_points_iter, self.max_group_size)
                 }
+                None => scored_points_iter.take(self.max_group_size).collect(),
             };
             groups.push(Group {
                 hits,
@@ -184,6 +200,7 @@ impl GroupsAggregator {
 #[cfg(test)]
 mod unit_tests {
 
+    use common::types::ScoreType;
     use segment::types::Payload;
     use serde_json::json;
 
@@ -196,6 +213,8 @@ mod unit_tests {
             score,
             payload: Some(Payload::from(serde_json::json!({ "docId": payloads }))),
             vector: None,
+            shard_key: None,
+            order_value: None,
         }
     }
 
@@ -206,6 +225,8 @@ mod unit_tests {
             score,
             payload: None,
             vector: None,
+            shard_key: None,
+            order_value: None,
         }
     }
 
@@ -217,8 +238,9 @@ mod unit_tests {
             point(3, 0.75, json!("b")),
         ];
 
-        let mut aggregator = GroupsAggregator::new(3, 2, "docId".to_string(), Order::LargeBetter);
-        for point in scored_points {
+        let mut aggregator =
+            GroupsAggregator::new(3, 2, "docId".parse().unwrap(), Some(Order::LargeBetter));
+        for point in &scored_points {
             aggregator.add_point(point).unwrap();
         }
 
@@ -263,7 +285,8 @@ mod unit_tests {
 
     #[test]
     fn it_adds_single_points() {
-        let mut aggregator = GroupsAggregator::new(4, 3, "docId".to_string(), Order::LargeBetter);
+        let mut aggregator =
+            GroupsAggregator::new(4, 3, "docId".parse().unwrap(), Some(Order::LargeBetter));
 
         // cases
         #[rustfmt::skip]
@@ -282,15 +305,15 @@ mod unit_tests {
             Case::new(json!("a"), 8, 4, Ok(()), point(104, 0.35, json!("a"))), // small score 'a'
             Case::new(json!("a"), 9, 4, Ok(()), point(105, 0.36, json!("a"))), // small score 'a'
             Case::new(json!("b"), 3, 4, Ok(()), point(7, 1.0, json!("b"))),
-            Case::new(json!("false"), 0, 4, Err(BadKeyType), point(8, 1.0, json!(false))),
-            Case::new(json!("none"), 0, 4, Err(KeyNotFound), empty_point(9, 1.0)),
+            Case::new(json!("false"), 0, 4, Err(AggregatorError::BadKeyType), point(8, 1.0, json!(false))),
+            Case::new(json!("none"), 0, 4, Err(AggregatorError::KeyNotFound), empty_point(9, 1.0)),
             Case::new(json!(3), 2, 4, Ok(()), point(10, 0.6, json!(3))),
             Case::new(json!(3), 3, 4, Ok(()), point(11, 0.1, json!(3))),
         ]
         .into_iter()
         .enumerate()
         .for_each(|(case_idx, case)| {
-            let result = aggregator.add_point(case.point);
+            let result = aggregator.add_point(&case.point);
 
             assert_eq!(result, case.expected_result, "case {case_idx}");
 
@@ -304,7 +327,7 @@ mod unit_tests {
                     "case {case_idx}"
                 );
             } else {
-                assert!(aggregator.groups.get(key).is_none(), "case {case_idx}");
+                assert!(!aggregator.groups.contains_key(key), "case {case_idx}");
             }
         });
 
@@ -351,10 +374,10 @@ mod unit_tests {
             ),
         ];
 
-        for ((key, expected_group_points), group) in
+        for ((expected_key, expected_group_points), group) in
             expected_groups.into_iter().zip(groups.into_iter())
         {
-            assert_eq!(key, group.key);
+            assert_eq!(expected_key, group.key);
             let expected_id_score: Vec<_> = expected_group_points
                 .into_iter()
                 .map(|x| (x.id, x.score))
@@ -366,7 +389,8 @@ mod unit_tests {
 
     #[test]
     fn test_aggregate_less_groups() {
-        let mut aggregator = GroupsAggregator::new(3, 2, "docId".to_string(), Order::LargeBetter);
+        let mut aggregator =
+            GroupsAggregator::new(3, 2, "docId".parse().unwrap(), Some(Order::LargeBetter));
 
         // cases
         [
@@ -387,7 +411,7 @@ mod unit_tests {
             point(10, 0.6, json!(3)),
             point(11, 0.1, json!(3)),
         ]
-        .into_iter()
+        .iter()
         .for_each(|point| {
             aggregator.add_point(point).unwrap();
         });

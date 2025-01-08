@@ -1,14 +1,11 @@
 import pathlib
 
-import requests
-from .fixtures import create_collection, upsert_random_points, random_vector, search
+from .fixtures import create_collection, upsert_random_points, random_dense_vector, search, random_sparse_vector
 from .utils import *
-from .assertions import assert_http_ok
 
 N_PEERS = 3
 N_SHARDS = 3
 COLLECTION_NAME = "test_collection"
-
 
 def create_snapshot(peer_api_uri):
     r = requests.post(f"{peer_api_uri}/collections/{COLLECTION_NAME}/snapshots")
@@ -67,13 +64,20 @@ def recover_from_snapshot(tmp_path: pathlib.Path, n_replicas):
     wait_collection_exists_and_active_on_all_peers(collection_name=COLLECTION_NAME, peer_api_uris=peer_api_uris)
 
     create_payload_index(peer_api_uris[0], COLLECTION_NAME, "city", "keyword")
+
+    wait_for_same_commit(peer_api_uris=peer_api_uris)
+
     upsert_random_points(peer_api_uris[0], 100)
 
     query_city = "London"
-    query_vector = random_vector()
 
-    search_result = search(peer_api_uris[0], query_vector, query_city)
-    assert len(search_result) > 0
+    dense_query_vector = random_dense_vector()
+    dense_search_result = search(peer_api_uris[0], dense_query_vector, query_city)
+    assert len(dense_search_result) > 0
+
+    sparse_query_vector = {"name": "sparse-text", "vector": random_sparse_vector()}
+    sparse_search_result = search(peer_api_uris[0], sparse_query_vector, query_city)
+    assert len(sparse_search_result) > 0
 
     collection_info = get_collection_info(peer_api_uris[0], COLLECTION_NAME)
     points_with_indexed_payload = collection_info["payload_schema"]["city"]["points"]
@@ -82,9 +86,14 @@ def recover_from_snapshot(tmp_path: pathlib.Path, n_replicas):
     snapshot_name = create_snapshot(peer_api_uris[-1])
     assert snapshot_name is not None
 
-    # move file
+    # move snapshots across peers. 
+    #
     snapshot_path = Path(peer_dirs[-1]) / "snapshots" / COLLECTION_NAME / snapshot_name
     assert snapshot_path.exists()
+    # we setup the snapshots base paths on the peer where snapshot from an another peer will 
+    # be moved.
+    create_snapshot(peer_api_uris[0]) 
+    # move
     snapshot_path.rename(Path(peer_dirs[0]) / "snapshots" / COLLECTION_NAME / snapshot_name)
 
     process_peer_id = get_peer_id(peer_api_uris[-1])
@@ -137,11 +146,19 @@ def recover_from_snapshot(tmp_path: pathlib.Path, n_replicas):
     for i in range(len(new_local_shards)):
         assert new_local_shards[i] == local_shards[i]
 
-    new_search_result = search(new_url, query_vector, query_city)
+    # check that the dense vectors are still the same
+    new_dense_search_result = search(new_url, dense_query_vector, query_city)
+    assert len(new_dense_search_result) == len(dense_search_result)
+    for i in range(len(new_dense_search_result)):
+        assert new_dense_search_result[i] == dense_search_result[i]
 
-    assert len(new_search_result) == len(search_result)
-    for i in range(len(new_search_result)):
-        assert new_search_result[i] == search_result[i]
+    # check that the sparse vectors are still the same
+    new_sparse_search_result = search(new_url, sparse_query_vector, query_city)
+    assert len(new_sparse_search_result) == len(sparse_search_result)
+    for i in range(len(new_sparse_search_result)):
+        # skip score check because it is not deterministic
+        new_sparse_search_result[i]["score"] = sparse_search_result[i]["score"]
+        assert new_sparse_search_result[i] == sparse_search_result[i]
 
     new_collection_info = get_collection_info(new_url, COLLECTION_NAME)
     new_points_with_indexed_payload = new_collection_info["payload_schema"]["city"]["points"]

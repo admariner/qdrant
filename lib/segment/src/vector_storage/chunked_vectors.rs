@@ -1,25 +1,24 @@
 use std::cmp::max;
 use std::collections::TryReserveError;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::mem;
 use std::path::Path;
 
-use common::types::PointOffsetType;
-
-use super::div_ceil;
 use crate::common::vector_utils::{TrySetCapacity, TrySetCapacityExact};
+use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
+use crate::vector_storage::common::CHUNK_SIZE;
 
-// chunk size in bytes
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
-
-// if dimension is too high, use this capacity
-const MIN_CHUNK_CAPACITY: usize = 16;
-
+#[derive(Debug)]
 pub struct ChunkedVectors<T> {
+    /// Vector's dimension.
+    ///
+    /// Each vector will consume `size_of::<T>() * dim` bytes.
     dim: usize,
-    len: usize,            // amount of stored vectors
-    chunk_capacity: usize, // max amount of vectors in each chunk
+    /// Number of stored vectors in all chunks.
+    len: usize,
+    /// Maximum number of vectors in each chunk.
+    chunk_capacity: usize,
     chunks: Vec<Vec<T>>,
 }
 
@@ -27,7 +26,8 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
     pub fn new(dim: usize) -> Self {
         assert_ne!(dim, 0, "The vector's dimension cannot be 0");
         let vector_size = dim * mem::size_of::<T>();
-        let chunk_capacity = max(MIN_CHUNK_CAPACITY, CHUNK_SIZE / vector_size);
+        let chunk_capacity = CHUNK_SIZE / vector_size;
+        assert_ne!(chunk_capacity, 0, "The vector's size is too big");
         Self {
             dim,
             len: 0,
@@ -44,47 +44,127 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
         self.len == 0
     }
 
-    pub fn get<TKey>(&self, key: TKey) -> &[T]
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
-        let key: usize = key.as_();
-        let chunk_data = &self.chunks[key / self.chunk_capacity];
-        let idx = (key % self.chunk_capacity) * self.dim;
-        &chunk_data[idx..idx + self.dim]
+    pub fn get(&self, key: VectorOffsetType) -> &[T] {
+        self.get_opt(key).expect("vector not found")
     }
 
-    pub fn push(&mut self, vector: &[T]) -> Result<PointOffsetType, TryReserveError> {
-        let new_id = self.len as PointOffsetType;
+    pub fn get_opt(&self, key: VectorOffsetType) -> Option<&[T]> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + self.dim;
+                chunk_data.get(range)
+            })
+    }
+
+    pub fn get_many(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + count * self.dim;
+                chunk_data.get(range)
+            })
+    }
+
+    pub fn push(&mut self, vector: &[T]) -> Result<VectorOffsetType, TryReserveError> {
+        let new_id = self.len;
         self.insert(new_id, vector)?;
         Ok(new_id)
     }
 
-    pub fn insert(&mut self, key: PointOffsetType, vector: &[T]) -> Result<(), TryReserveError> {
-        let key = key as usize;
-        self.len = max(self.len, key + 1);
-        self.chunks
-            .resize(div_ceil(self.len, self.chunk_capacity), vec![]);
+    // returns how many flattened vectors can be inserted starting from key
+    pub fn get_chunk_left_keys(&self, start_key: VectorOffsetType) -> usize {
+        self.chunk_capacity - (start_key % self.chunk_capacity)
+    }
+
+    pub fn insert(&mut self, key: VectorOffsetType, vector: &[T]) -> Result<(), TryReserveError> {
+        assert_eq!(vector.len(), self.dim, "Vector size mismatch");
+        self.insert_many(key, vector, 1)
+    }
+
+    pub fn insert_many(
+        &mut self,
+        key: VectorOffsetType,
+        vectors: &[T],
+        vectors_count: usize,
+    ) -> Result<(), TryReserveError> {
+        assert_eq!(
+            vectors.len(),
+            vectors_count * self.dim,
+            "Vector size mismatch"
+        );
+        assert!(
+            self.get_chunk_left_keys(key) >= vectors_count,
+            "Index out of bounds"
+        );
+
+        let desired_capacity = self.chunk_capacity * self.dim;
+        let new_len = max(self.len, key + vectors_count);
+        let chunks_len = new_len.div_ceil(self.chunk_capacity);
+
+        if chunks_len > self.chunks.len() {
+            // All chunks except the last one should be fully allocated.
+            // If we are going to add new chunks, resize last one which may be partially allocated.
+            if let Some(last_chunk) = self.chunks.last_mut() {
+                last_chunk.try_set_capacity_exact(desired_capacity)?;
+                last_chunk.resize_with(desired_capacity, T::default);
+            }
+
+            self.chunks.try_set_capacity(chunks_len)?;
+
+            let new_chunks = chunks_len - self.chunks.len();
+            let skipped_chunks = new_chunks - 1;
+
+            // All skipped chunks should be fully allocated.
+            for _ in 0..skipped_chunks {
+                let mut chunk = Vec::new();
+                chunk.try_set_capacity_exact(desired_capacity)?;
+                chunk.resize_with(desired_capacity, T::default);
+                self.chunks.push(chunk);
+            }
+
+            // Add new chunk with lower capacity.
+            self.chunks.push(Default::default());
+            assert_eq!(self.chunks.len(), chunks_len);
+        }
 
         let chunk_idx = key / self.chunk_capacity;
         let chunk_data = &mut self.chunks[chunk_idx];
         let idx = (key % self.chunk_capacity) * self.dim;
-        if chunk_data.len() < idx + self.dim {
-            if chunk_idx == 0 {
-                // Do not overallocate the first chunk, because it is likely to be small
-                // and we don't want to waste memory.
-                let desired_capacity = idx + self.dim;
-                chunk_data.try_set_capacity(desired_capacity)?;
-            } else {
-                // Once we have more than one chunk, we don't want to overallocate
-                // and we keep the exact capacity of each chunk.
-                let desired_capacity = self.chunk_capacity * self.dim;
+
+        // Grow the current chunk if needed to fit the new vector.
+        //
+        // All chunks are dynamically resized to fit their vectors in it.
+        // Chunks have a size of zero by default. It's grown with zeroes to fit new vectors.
+        //
+        // The capacity for the first chunk is allocated normally to keep the memory footprint as
+        // small as possible, see
+        // <https://doc.rust-lang.org/std/vec/struct.Vec.html#capacity-and-reallocation>).
+        // All other chunks allocate their capacity in full on first use to prevent expensive
+        // reallocations when their data grows.
+        if chunk_data.len() < idx + vectors.len() {
+            // If the chunk is not the first one, allocate it fully on first use
+            if chunk_idx != 0 {
                 chunk_data.try_set_capacity_exact(desired_capacity)?;
             }
-            chunk_data.resize(idx + self.dim, T::default());
+            chunk_data.resize_with(idx + vectors.len(), T::default);
         }
-        let data = &mut chunk_data[idx..idx + self.dim];
-        data.copy_from_slice(vector);
+
+        let data = &mut chunk_data[idx..idx + vectors.len()];
+        data.copy_from_slice(vectors);
+
+        // Update `self.len` only after the vector is successfully inserted.
+        // In case of OOM, `self.len` will not be updated.
+        self.len = new_len;
+
         Ok(())
     }
 }
@@ -108,9 +188,10 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
                     format!("Failed to load quantized vectors from file: {err}"),
                 )
             })?;
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
         let mut buffer = vec![0u8; quantized_vector_size];
-        while file.read_exact(&mut buffer).is_ok() {
+        while reader.read_exact(&mut buffer).is_ok() {
             vectors.push(&buffer).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
@@ -136,17 +217,17 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
         for i in 0..self.len() {
             buffer.write_all(self.get(i))?;
         }
-        buffer.flush()?;
+        buffer.sync_all()?;
         Ok(())
     }
 }
 
 impl<T: Clone> TrySetCapacityExact for ChunkedVectors<T> {
     fn try_set_capacity_exact(&mut self, capacity: usize) -> Result<(), TryReserveError> {
-        let num_chunks = div_ceil(capacity, self.chunk_capacity);
+        let num_chunks = capacity.div_ceil(self.chunk_capacity);
         let last_chunk_idx = capacity / self.chunk_capacity;
         self.chunks.try_set_capacity_exact(num_chunks)?;
-        self.chunks.resize(num_chunks, vec![]);
+        self.chunks.resize_with(num_chunks, Vec::new);
         for chunk_idx in 0..num_chunks {
             if chunk_idx == last_chunk_idx {
                 let desired_capacity = (capacity % self.chunk_capacity) * self.dim;
@@ -169,5 +250,31 @@ impl quantization::EncodedStorageBuilder<ChunkedVectors<u8>> for ChunkedVectors<
         // Memory for ChunkedVectors are already pre-allocated,
         // so we do not expect any errors here.
         self.push(other).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_chunked_vectors_with_skipped_chunks() {
+        let mut vectors = ChunkedVectors::new(3);
+        assert_eq!(vectors.get_opt(0), None);
+
+        vectors.insert(0, &[1, 2, 3]).unwrap();
+        vectors.insert(10_000_000, &[4, 5, 6]).unwrap();
+        assert!(vectors.chunks.len() > 3);
+
+        assert_eq!(vectors.get(0), &[1, 2, 3]);
+        assert_eq!(vectors.get(10_000_000), &[4, 5, 6]);
+
+        assert_eq!(vectors.get_opt(10_000_001), None);
+
+        // check if first chunk is fully allocated
+        assert_eq!(vectors.get(100), &[0, 0, 0]);
+
+        // check if middle chunk is fully allocated
+        assert_eq!(vectors.get(5_000_000), &[0, 0, 0]);
     }
 }

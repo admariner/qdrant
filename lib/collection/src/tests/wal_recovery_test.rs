@@ -1,108 +1,15 @@
-use std::num::NonZeroU64;
 use std::sync::Arc;
 
-use segment::types::{Distance, PayloadFieldSchema, PayloadSchemaType};
+use common::cpu::CpuBudget;
+use segment::types::{PayloadFieldSchema, PayloadSchemaType};
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-use crate::config::{CollectionConfig, CollectionParams, WalConfig};
-use crate::operations::point_ops::{PointOperations, PointStruct};
-use crate::operations::types::{VectorParams, VectorsConfig};
-use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
+use crate::save_on_disk::SaveOnDisk;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
-use crate::tests::snapshot_test::TEST_OPTIMIZERS_CONFIG;
-
-fn create_collection_config() -> CollectionConfig {
-    let wal_config = WalConfig {
-        wal_capacity_mb: 1,
-        wal_segments_ahead: 0,
-    };
-
-    let collection_params = CollectionParams {
-        vectors: VectorsConfig::Single(VectorParams {
-            size: NonZeroU64::new(4).unwrap(),
-            distance: Distance::Dot,
-            hnsw_config: None,
-            quantization_config: None,
-            on_disk: None,
-        }),
-        ..CollectionParams::empty()
-    };
-
-    let mut optimizer_config = TEST_OPTIMIZERS_CONFIG.clone();
-
-    optimizer_config.default_segment_number = 1;
-    optimizer_config.flush_interval_sec = 0;
-
-    CollectionConfig {
-        params: collection_params,
-        optimizer_config,
-        wal_config,
-        hnsw_config: Default::default(),
-        quantization_config: Default::default(),
-    }
-}
-
-fn upsert_operation() -> CollectionUpdateOperations {
-    CollectionUpdateOperations::PointOperation(
-        vec![
-            PointStruct {
-                id: 1.into(),
-                vector: vec![1.0, 2.0, 3.0, 4.0].into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 10.12, "lon": 32.12  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 2.into(),
-                vector: vec![2.0, 1.0, 3.0, 4.0].into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 11.12, "lon": 34.82  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 3.into(),
-                vector: vec![3.0, 2.0, 1.0, 4.0].into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": [ { "lat": 12.12, "lon": 34.82  }, { "lat": 12.2, "lon": 12.82  }] }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 4.into(),
-                vector: vec![4.0, 2.0, 3.0, 1.0].into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 13.12, "lon": 34.82  } }"#).unwrap(),
-                ),
-            },
-            PointStruct {
-                id: 5.into(),
-                vector: vec![5.0, 2.0, 3.0, 4.0].into(),
-                payload: Some(
-                    serde_json::from_str(r#"{ "location": { "lat": 14.12, "lon": 32.12  } }"#).unwrap(),
-                ),
-            },
-
-        ]
-        .into(),
-    )
-}
-
-fn create_payload_index_operation() -> CollectionUpdateOperations {
-    CollectionUpdateOperations::FieldIndexOperation(FieldIndexOperations::CreateIndex(
-        CreateIndex {
-            field_name: "location".to_string(),
-            field_schema: Some(PayloadFieldSchema::FieldType(PayloadSchemaType::Geo)),
-        },
-    ))
-}
-
-fn delete_point_operation(idx: u64) -> CollectionUpdateOperations {
-    CollectionUpdateOperations::PointOperation(PointOperations::DeletePoints {
-        ids: vec![idx.into()],
-    })
-}
+use crate::tests::fixtures::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_delete_from_indexed_payload() {
@@ -114,31 +21,52 @@ async fn test_delete_from_indexed_payload() {
 
     let current_runtime: Handle = Handle::current();
 
+    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
+    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
+    let payload_index_schema =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
+
     let shard = LocalShard::build(
         0,
         collection_name.clone(),
         collection_dir.path(),
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
+        payload_index_schema.clone(),
         current_runtime.clone(),
+        current_runtime.clone(),
+        CpuBudget::default(),
+        config.optimizer_config.clone(),
     )
     .await
     .unwrap();
 
     let upsert_ops = upsert_operation();
 
-    shard.update(upsert_ops, true).await.unwrap();
+    shard.update(upsert_ops.into(), true).await.unwrap();
 
     let index_op = create_payload_index_operation();
 
-    shard.update(index_op, true).await.unwrap();
+    payload_index_schema
+        .write(|schema| {
+            schema.schema.insert(
+                "location".parse().unwrap(),
+                PayloadFieldSchema::FieldType(PayloadSchemaType::Geo),
+            );
+        })
+        .unwrap();
+    shard.update(index_op.into(), true).await.unwrap();
 
     let delete_point_op = delete_point_operation(4);
-    shard.update(delete_point_op, true).await.unwrap();
+    shard.update(delete_point_op.into(), true).await.unwrap();
 
     let info = shard.info().await.unwrap();
     eprintln!("info = {:#?}", info.payload_schema);
-    let number_of_indexed_points = info.payload_schema.get("location").unwrap().points;
+    let number_of_indexed_points = info
+        .payload_schema
+        .get(&"location".parse().unwrap())
+        .unwrap()
+        .points;
 
     drop(shard);
 
@@ -147,8 +75,12 @@ async fn test_delete_from_indexed_payload() {
         collection_name.clone(),
         collection_dir.path(),
         Arc::new(RwLock::new(config.clone())),
+        config.optimizer_config.clone(),
         Arc::new(Default::default()),
+        payload_index_schema.clone(),
         current_runtime.clone(),
+        current_runtime.clone(),
+        CpuBudget::default(),
     )
     .await
     .unwrap();
@@ -157,7 +89,7 @@ async fn test_delete_from_indexed_payload() {
 
     eprintln!("dropping point 5");
     let delete_point_op = delete_point_operation(5);
-    shard.update(delete_point_op, true).await.unwrap();
+    shard.update(delete_point_op.into(), true).await.unwrap();
 
     drop(shard);
 
@@ -165,9 +97,13 @@ async fn test_delete_from_indexed_payload() {
         0,
         collection_name,
         collection_dir.path(),
-        Arc::new(RwLock::new(config)),
+        Arc::new(RwLock::new(config.clone())),
+        config.optimizer_config.clone(),
         Arc::new(Default::default()),
+        payload_index_schema,
+        current_runtime.clone(),
         current_runtime,
+        CpuBudget::default(),
     )
     .await
     .unwrap();
@@ -175,7 +111,11 @@ async fn test_delete_from_indexed_payload() {
     let info = shard.info().await.unwrap();
     eprintln!("info = {:#?}", info.payload_schema);
 
-    let number_of_indexed_points_after_load = info.payload_schema.get("location").unwrap().points;
+    let number_of_indexed_points_after_load = info
+        .payload_schema
+        .get(&"location".parse().unwrap())
+        .unwrap()
+        .points;
 
     assert_eq!(number_of_indexed_points, 4);
     assert_eq!(number_of_indexed_points_after_load, 3);

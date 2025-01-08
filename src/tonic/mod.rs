@@ -1,7 +1,8 @@
 mod api;
-mod api_key;
+mod auth;
 mod logging;
 mod tonic_telemetry;
+pub(super) mod verification;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -14,36 +15,41 @@ use ::api::grpc::grpc_health_v1::{
     HealthCheckRequest as ProtocolHealthCheckRequest,
     HealthCheckResponse as ProtocolHealthCheckResponse,
 };
-use ::api::grpc::models::VersionInfo;
 use ::api::grpc::qdrant::collections_internal_server::CollectionsInternalServer;
 use ::api::grpc::qdrant::collections_server::CollectionsServer;
 use ::api::grpc::qdrant::points_internal_server::PointsInternalServer;
 use ::api::grpc::qdrant::points_server::PointsServer;
 use ::api::grpc::qdrant::qdrant_internal_server::{QdrantInternal, QdrantInternalServer};
 use ::api::grpc::qdrant::qdrant_server::{Qdrant, QdrantServer};
+use ::api::grpc::qdrant::shard_snapshots_server::ShardSnapshotsServer;
 use ::api::grpc::qdrant::snapshots_server::SnapshotsServer;
 use ::api::grpc::qdrant::{
-    HealthCheckReply, HealthCheckRequest, HttpPortRequest, HttpPortResponse,
+    GetConsensusCommitRequest, GetConsensusCommitResponse, HealthCheckReply, HealthCheckRequest,
     WaitOnConsensusCommitRequest, WaitOnConsensusCommitResponse,
 };
 use ::api::grpc::QDRANT_DESCRIPTOR_SET;
+use ::api::rest::models::VersionInfo;
+use collection::operations::verification::new_unchecked_verification_pass;
 use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
+use storage::rbac::Access;
 use tokio::runtime::Handle;
 use tokio::signal;
 use tonic::codec::CompressionEncoding;
 use tonic::transport::{Server, ServerTlsConfig};
 use tonic::{Request, Response, Status};
 
+use crate::common::auth::AuthKeys;
 use crate::common::helpers;
+use crate::common::http_client::HttpClient;
 use crate::common::telemetry_ops::requests_telemetry::TonicTelemetryCollector;
 use crate::settings::Settings;
 use crate::tonic::api::collections_api::CollectionsService;
 use crate::tonic::api::collections_internal_api::CollectionsInternalService;
 use crate::tonic::api::points_api::PointsService;
 use crate::tonic::api::points_internal_api::PointsInternalService;
-use crate::tonic::api::snapshots_api::SnapshotsService;
+use crate::tonic::api::snapshots_api::{ShardSnapshotsService, SnapshotsService};
 
 #[derive(Default)]
 pub struct QdrantService {}
@@ -77,7 +83,7 @@ impl Health for HealthService {
 }
 
 pub struct QdrantInternalService {
-    /// HTTP port accessible from inside the cluster
+    /// Qdrant settings
     settings: Settings,
     /// Consensus state
     consensus_state: ConsensusStateRef,
@@ -94,13 +100,14 @@ impl QdrantInternalService {
 
 #[tonic::async_trait]
 impl QdrantInternal for QdrantInternalService {
-    async fn get_http_port(
+    async fn get_consensus_commit(
         &self,
-        _request: Request<HttpPortRequest>,
-    ) -> Result<Response<HttpPortResponse>, Status> {
-        Ok(Response::new(HttpPortResponse {
-            port: self.settings.service.http_port as i32,
-        }))
+        _: tonic::Request<GetConsensusCommitRequest>,
+    ) -> Result<Response<GetConsensusCommitResponse>, Status> {
+        let persistent = self.consensus_state.persistent.read();
+        let commit = persistent.state.hard_state.commit as _;
+        let term = persistent.state.hard_state.term as _;
+        Ok(Response::new(GetConsensusCommitResponse { commit, term }))
     }
 
     async fn wait_on_consensus_commit(
@@ -115,7 +122,8 @@ impl QdrantInternal for QdrantInternalService {
         let ok = self
             .consensus_state
             .wait_for_consensus_commit(commit, term, consensus_tick, timeout)
-            .await;
+            .await
+            .is_ok();
         Ok(Response::new(WaitOnConsensusCommitResponse { ok }))
     }
 }
@@ -151,7 +159,7 @@ pub fn init(
         let qdrant_service = QdrantService::default();
         let health_service = HealthService::default();
         let collections_service = CollectionsService::new(dispatcher.clone());
-        let points_service = PointsService::new(dispatcher.toc().clone());
+        let points_service = PointsService::new(dispatcher.clone(), settings.service.clone());
         let snapshot_service = SnapshotsService::new(dispatcher.clone());
 
         // Only advertise the public services. By default, all services in QDRANT_DESCRIPTOR_SET
@@ -188,12 +196,18 @@ pub fn init(
             .layer(tonic_telemetry::TonicTelemetryLayer::new(
                 telemetry_collector,
             ))
-            .option_layer(
-                settings
-                    .service
-                    .api_key
-                    .map(api_key::ApiKeyMiddlewareLayer::new),
-            )
+            .option_layer({
+                AuthKeys::try_create(
+                    &settings.service,
+                    dispatcher
+                        .toc(
+                            &Access::full("For tonic auth middleware"),
+                            &new_unchecked_verification_pass(),
+                        )
+                        .clone(),
+                )
+                .map(auth::AuthLayer::new)
+            })
             .into_inner();
 
         server
@@ -255,16 +269,21 @@ pub fn init_internal(
 
     use crate::tonic::api::raft_api::RaftService;
 
+    let http_client = HttpClient::from_settings(&settings)?;
+
     runtime
         .block_on(async {
             let socket = SocketAddr::from((host.parse::<IpAddr>().unwrap(), internal_grpc_port));
 
             let qdrant_service = QdrantService::default();
+            let points_internal_service =
+                PointsInternalService::new(toc.clone(), settings.service.clone());
             let qdrant_internal_service =
                 QdrantInternalService::new(settings, consensus_state.clone());
             let collections_internal_service = CollectionsInternalService::new(toc.clone());
-            let points_internal_service = PointsInternalService::new(toc.clone());
-            let raft_service = RaftService::new(to_consensus, consensus_state);
+            let shard_snapshots_service = ShardSnapshotsService::new(toc.clone(), http_client);
+            let raft_service =
+                RaftService::new(to_consensus, consensus_state, tls_config.is_some());
 
             log::debug!("Qdrant internal gRPC listening on {}", internal_grpc_port);
 
@@ -316,6 +335,12 @@ pub fn init_internal(
                 )
                 .add_service(
                     PointsInternalServer::new(points_internal_service)
+                        .send_compressed(CompressionEncoding::Gzip)
+                        .accept_compressed(CompressionEncoding::Gzip)
+                        .max_decoding_message_size(usize::MAX),
+                )
+                .add_service(
+                    ShardSnapshotsServer::new(shard_snapshots_service)
                         .send_compressed(CompressionEncoding::Gzip)
                         .accept_compressed(CompressionEncoding::Gzip)
                         .max_decoding_message_size(usize::MAX),

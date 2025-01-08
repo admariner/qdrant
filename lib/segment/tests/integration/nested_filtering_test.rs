@@ -6,6 +6,7 @@ use common::types::PointOffsetType;
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::index::PayloadIndex;
+use segment::json_path::JsonPath;
 use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::payload_storage::PayloadStorage;
 use segment::types::{Condition, FieldCondition, Filter, Match, Payload, PayloadSchemaType, Range};
@@ -63,47 +64,54 @@ fn test_filtering_context_consistency() {
     for (idx, payload) in nested_payloads().into_iter().enumerate() {
         points.insert(idx, payload.clone());
         payload_storage
-            .assign(idx as PointOffsetType, &payload)
+            .set(idx as PointOffsetType, &payload)
             .unwrap();
     }
 
     let wrapped_payload_storage = Arc::new(AtomicRefCell::new(payload_storage.into()));
     let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(NUM_POINTS)));
 
-    let mut index =
-        StructPayloadIndex::open(wrapped_payload_storage, id_tracker, dir.path(), true).unwrap();
+    let mut index = StructPayloadIndex::open(
+        wrapped_payload_storage,
+        id_tracker,
+        HashMap::new(),
+        dir.path(),
+        true,
+    )
+    .unwrap();
 
     index
-        .set_indexed("f", PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new("f"), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed("arr1[].a", PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new("arr1[].a"), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed("arr1[].b", PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new("arr1[].b"), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed("arr1[].c", PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new("arr1[].c"), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed("arr1[].d", PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new("arr1[].d"), PayloadSchemaType::Integer)
         .unwrap();
     index
-        .set_indexed("arr1[].text", PayloadSchemaType::Text.into())
+        .set_indexed(&JsonPath::new("arr1[].text"), PayloadSchemaType::Text)
         .unwrap();
 
     {
         let nested_condition_0 = Condition::new_nested(
-            "arr1",
+            JsonPath::new("arr1"),
             Filter {
                 must: Some(vec![
                     // E.g. idx = 6 => { "a" = 1, "b" = 7, "c" = 1, "d" = 0 }
-                    Condition::Field(FieldCondition::new_match("a", 1.into())),
-                    Condition::Field(FieldCondition::new_match("c", 1.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("a"), 1.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("c"), 1.into())),
                 ]),
                 should: None,
+                min_should: None,
                 must_not: Some(vec![Condition::Field(FieldCondition::new_range(
-                    "d",
+                    JsonPath::new("d"),
                     Range {
                         lte: Some(1.into()),
                         ..Default::default()
@@ -135,15 +143,16 @@ fn test_filtering_context_consistency() {
 
     {
         let nested_condition_1 = Condition::new_nested(
-            "arr1",
+            JsonPath::new("arr1"),
             Filter {
                 must: Some(vec![
                     // E.g. idx = 6 => { "a" = 1, "b" = 7, "c" = 1, "d" = 0 }
-                    Condition::Field(FieldCondition::new_match("a", 1.into())),
-                    Condition::Field(FieldCondition::new_match("c", 1.into())),
-                    Condition::Field(FieldCondition::new_match("d", 0.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("a"), 1.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("c"), 1.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("d"), 0.into())),
                 ]),
                 should: None,
+                min_should: None,
                 must_not: None,
             },
         );
@@ -166,18 +175,19 @@ fn test_filtering_context_consistency() {
 
     {
         let nested_condition_2 = Condition::new_nested(
-            "arr1",
+            JsonPath::new("arr1"),
             Filter {
                 must: Some(vec![
                     // E.g. idx = 6 => { "a" = 1, "b" = 7, "c" = 1, "d" = 0 }
-                    Condition::Field(FieldCondition::new_match("a", 1.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("a"), 1.into())),
                     Condition::Field(FieldCondition::new_match(
-                        "text",
+                        JsonPath::new("text"),
                         Match::Text("c1".to_string().into()),
                     )),
-                    Condition::Field(FieldCondition::new_match("d", 0.into())),
+                    Condition::Field(FieldCondition::new_match(JsonPath::new("d"), 0.into())),
                 ]),
                 should: None,
+                min_should: None,
                 must_not: None,
             },
         );
@@ -199,32 +209,25 @@ fn test_filtering_context_consistency() {
 
     {
         let nested_condition_3 = Condition::new_nested(
-            "arr1",
-            Filter {
-                must: Some(vec![Condition::Field(FieldCondition::new_match(
-                    "b",
-                    1.into(),
-                ))]),
-                should: None,
-                must_not: None,
-            },
+            JsonPath::new("arr1"),
+            Filter::new_must(Condition::Field(FieldCondition::new_match(
+                JsonPath::new("b"),
+                1.into(),
+            ))),
         );
 
         let nester_condition_3_1 = Condition::new_nested(
-            "arr2",
+            JsonPath::new("arr2"),
             Filter {
                 must: Some(vec![Condition::new_nested(
-                    "arr3",
-                    Filter {
-                        must: Some(vec![Condition::Field(FieldCondition::new_match(
-                            "b",
-                            10.into(),
-                        ))]),
-                        should: None,
-                        must_not: None,
-                    },
+                    JsonPath::new("arr3"),
+                    Filter::new_must(Condition::Field(FieldCondition::new_match(
+                        JsonPath::new("b"),
+                        10.into(),
+                    ))),
                 )]),
                 should: None,
+                min_should: None,
                 must_not: None,
             },
         );
@@ -232,6 +235,7 @@ fn test_filtering_context_consistency() {
         let nested_filter_3 = Filter {
             must: Some(vec![nested_condition_3, nester_condition_3_1]),
             should: None,
+            min_should: None,
             must_not: None,
         };
 

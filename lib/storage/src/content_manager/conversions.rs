@@ -1,3 +1,9 @@
+use collection::operations::config_diff::{
+    CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
+};
+use collection::operations::conversions::sharding_method_from_proto;
+use collection::operations::types::{SparseVectorsConfig, VectorsConfigDiff};
+use segment::types::StrictModeConfig;
 use tonic::Status;
 
 use crate::content_manager::collection_meta_ops::{
@@ -8,16 +14,24 @@ use crate::content_manager::collection_meta_ops::{
 };
 use crate::content_manager::errors::StorageError;
 
-pub fn error_to_status(error: StorageError) -> tonic::Status {
-    let error_code = match &error {
-        StorageError::BadInput { .. } => tonic::Code::InvalidArgument,
-        StorageError::NotFound { .. } => tonic::Code::NotFound,
-        StorageError::ServiceError { .. } => tonic::Code::Internal,
-        StorageError::BadRequest { .. } => tonic::Code::InvalidArgument,
-        StorageError::Locked { .. } => tonic::Code::FailedPrecondition,
-        StorageError::Timeout { .. } => tonic::Code::DeadlineExceeded,
-    };
-    tonic::Status::new(error_code, format!("{error}"))
+impl From<StorageError> for tonic::Status {
+    fn from(error: StorageError) -> Self {
+        let error_code = match &error {
+            StorageError::BadInput { .. } => tonic::Code::InvalidArgument,
+            StorageError::NotFound { .. } => tonic::Code::NotFound,
+            StorageError::ServiceError { .. } => tonic::Code::Internal,
+            StorageError::BadRequest { .. } => tonic::Code::InvalidArgument,
+            StorageError::Locked { .. } => tonic::Code::FailedPrecondition,
+            StorageError::Timeout { .. } => tonic::Code::DeadlineExceeded,
+            StorageError::AlreadyExists { .. } => tonic::Code::AlreadyExists,
+            StorageError::ChecksumMismatch { .. } => tonic::Code::DataLoss,
+            StorageError::Forbidden { .. } => tonic::Code::PermissionDenied,
+            StorageError::PreconditionFailed { .. } => tonic::Code::FailedPrecondition,
+            StorageError::InferenceError { .. } => tonic::Code::InvalidArgument,
+            StorageError::RateLimitExceeded { .. } => tonic::Code::ResourceExhausted,
+        };
+        Status::new(error_code, format!("{error}"))
+    }
 }
 
 impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
@@ -29,11 +43,16 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
             CreateCollection {
                 vectors: match value.vectors_config.and_then(|config| config.config) {
                     Some(vector_config) => vector_config.try_into()?,
-                    None => return Err(Status::invalid_argument("vectors config is required")),
+                    // TODO(sparse): sparse or dense vectors config is required
+                    None => Default::default(),
                 },
+                sparse_vectors: value
+                    .sparse_vectors_config
+                    .map(|v| SparseVectorsConfig::try_from(v).map(|SparseVectorsConfig(x)| x))
+                    .transpose()?,
                 hnsw_config: value.hnsw_config.map(|v| v.into()),
                 wal_config: value.wal_config.map(|v| v.into()),
-                optimizers_config: value.optimizers_config.map(|v| v.into()),
+                optimizers_config: value.optimizers_config.map(TryFrom::try_from).transpose()?,
                 shard_number: value.shard_number,
                 on_disk_payload: value.on_disk_payload,
                 replication_factor: value.replication_factor,
@@ -45,8 +64,36 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
                     .quantization_config
                     .map(TryInto::try_into)
                     .transpose()?,
+                sharding_method: value
+                    .sharding_method
+                    .map(sharding_method_from_proto)
+                    .transpose()?,
+                strict_mode_config: value.strict_mode_config.map(strict_mode_from_api),
+                uuid: None,
             },
         )))
+    }
+}
+
+pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> StrictModeConfig {
+    StrictModeConfig {
+        enabled: value.enabled,
+        max_query_limit: value.max_query_limit.map(|i| i as usize),
+        max_timeout: value.max_timeout.map(|i| i as usize),
+        unindexed_filtering_retrieve: value.unindexed_filtering_retrieve,
+        unindexed_filtering_update: value.unindexed_filtering_update,
+        search_max_hnsw_ef: value.search_max_hnsw_ef.map(|i| i as usize),
+        search_allow_exact: value.search_allow_exact,
+        search_max_oversampling: value.search_max_oversampling.map(f64::from),
+        upsert_max_batchsize: value.upsert_max_batchsize.map(|i| i as usize),
+        max_collection_vector_size_bytes: value
+            .max_collection_vector_size_bytes
+            .map(|i| i as usize),
+        read_rate_limit: value.write_rate_limit.map(|i| i as usize),
+        write_rate_limit: value.write_rate_limit.map(|i| i as usize),
+        max_collection_payload_size_bytes: value
+            .max_collection_payload_size_bytes
+            .map(|i| i as usize),
     }
 }
 
@@ -60,15 +107,26 @@ impl TryFrom<api::grpc::qdrant::UpdateCollection> for CollectionMetaOperations {
                 vectors: value
                     .vectors_config
                     .and_then(|config| config.config)
-                    .map(TryInto::try_into)
+                    .map(VectorsConfigDiff::try_from)
                     .transpose()?,
-                hnsw_config: value.hnsw_config.map(Into::into),
-                params: value.params.map(TryInto::try_into).transpose()?,
-                optimizers_config: value.optimizers_config.map(Into::into),
+                hnsw_config: value.hnsw_config.map(HnswConfigDiff::from),
+                params: value
+                    .params
+                    .map(CollectionParamsDiff::try_from)
+                    .transpose()?,
+                optimizers_config: value
+                    .optimizers_config
+                    .map(OptimizersConfigDiff::try_from)
+                    .transpose()?,
                 quantization_config: value
                     .quantization_config
-                    .map(TryInto::try_into)
+                    .map(QuantizationConfigDiff::try_from)
                     .transpose()?,
+                sparse_vectors: value
+                    .sparse_vectors_config
+                    .map(SparseVectorsConfig::try_from)
+                    .transpose()?,
+                strict_mode_config: value.strict_mode_config.map(StrictModeConfig::from),
             },
         )))
     }
